@@ -1,0 +1,107 @@
+# Ps3p: builds the iOS IPA (full RPCS3 core via ARMSX3's iOS port) on GitHub-hosted macOS runners.
+# The first run builds LLVM for iOS and caches it; later runs reuse the cache.
+name: Ps3p iOS
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'LICENSE*', '.gitignore']
+  workflow_dispatch:
+
+concurrency:
+  group: ps3p-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ios-deps:
+    name: iOS dependencies
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          brew install cmake ninja ccache coreutils
+          rustup target add aarch64-apple-ios
+
+      - name: Fetch the LLVM sources
+        run: bash ios/scripts/bootstrap-submodules.sh --with-llvm
+
+      - uses: ./.github/actions/ios-deps
+        with:
+          build: 'true'
+
+  ios:
+    name: iOS
+    needs: ios-deps
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros,pch_defines
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CMAKE_OBJC_COMPILER_LAUNCHER: ccache
+      CMAKE_OBJCXX_COMPILER_LAUNCHER: ccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools
+        run: |
+          brew install cmake ninja xcodegen ccache
+          rustup target add aarch64-apple-ios
+
+      - name: Fetch the submodules
+        run: bash ios/scripts/bootstrap-submodules.sh --with-llvm
+
+      - uses: ./.github/actions/ios-deps
+
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-ios-core-${{ github.run_id }}
+          restore-keys: ccache-ios-core-
+
+      - name: Configure the core
+        run: bash ios/configure.sh ios-llvm
+
+      - name: Build the core
+        run: |
+          cmake --build ios/build/ios-llvm --target rpcs3_emu armsx3_bridge armsx3_ios_render -- -j 4
+          bash ios/scripts/collect-ios-archives.sh ios-llvm
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Build the unsigned IPA
+        run: SIGN=0 bash ios/scripts/build-ios-ipa.sh
+
+      - name: Show the compiler errors
+        if: failure()
+        run: grep -n "error:" ios/build/ipa/xcodebuild-Release.log | head -30 | cut -c1-400 || true
+
+      - name: Name the IPA
+        run: cp ios/build/ipa/ARMSX3-Release-ios-llvm-unsigned.ipa ios/build/ipa/Ps3p.ipa
+
+      - name: Upload the IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ps3p-ios-unsigned
+          path: ios/build/ipa/Ps3p.ipa
+          if-no-files-found: error

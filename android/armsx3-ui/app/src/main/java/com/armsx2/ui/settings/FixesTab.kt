@@ -1,0 +1,477 @@
+package com.armsx2.ui.settings
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Surface
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.sp
+import com.armsx2.DevTools
+import com.armsx2.ui.common.GlobalConfirm
+import java.io.File
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.MutableState
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.armsx2.config.Settings
+import com.armsx2.i18n.I18n
+import com.armsx2.i18n.str
+import com.armsx2.ui.InGameOverlay
+
+/**
+ * Hardware / upscaling compatibility fixes — the PCSX2 "Hardware Fixes" and
+ * "Upscaling Fixes" panels. Split out of [RendererTab] so Render keeps only
+ * core quality/display settings.
+ *
+ * Every row writes into [Settings] via [InGameOverlay.saveSettings]; on a
+ * running VM that reconfigures the GS live (Settings.applyGsLive → native
+ * applyGSSettingsLive) so changes show without a restart. Note PCSX2 masks
+ * upscaling hacks at native (1x) resolution and masks every UserHacks_* key
+ * unless at least one fix is enabled — both are intentional parity behaviours.
+ */
+@Composable
+fun FixesTab(state: MutableState<Settings>) {
+    val s = state.value
+    fun apply(updated: Settings) = InGameOverlay.saveSettings(updated)
+
+    // Rebuilt from scratch against RPCS3's Core section. Everything that was here
+    // -- upscaling fixes, half-pixel offset, sprite rounding, CLUT/palette
+    // handling, texture-inside-RT, skipdraw ranges, software renderer threads --
+    // describes the PS2's GS and has no counterpart on the PS3. None of it was
+    // reachable by the RPCS3 config tree, so all of it did nothing.
+    Column(modifier = Modifier.fillMaxWidth()) {
+        CollapsibleSection(str("adv.section.cpuAccuracy"), initiallyExpanded = true) {
+            HelpText(
+                str("adv.section.cpuAccuracy.help"),
+                modifier = Modifier.padding(horizontal = 6.dp),
+            )
+            SegmentedGridRow(
+                label = str("adv.xfloat.label"),
+                options = listOf(
+                    str("adv.xfloat.accurate"),
+                    str("adv.xfloat.approximate"),
+                    str("adv.xfloat.relaxed"),
+                    str("adv.xfloat.inaccurate"),
+                ),
+                selectedIndex = s.ps3.spuXFloat.coerceIn(0, 3),
+                columns = 2,
+                description = str("adv.xfloat.description"),
+                onChange = { apply(s.copy(ps3 = s.ps3.copy(spuXFloat = it))) },
+                notDefault = s.notDefault { it.ps3.spuXFloat },
+            )
+            SettingsDivider()
+            ToggleRow(
+                str("adv.accurateSpuRsv.label"),
+                s.ps3.accurateSpuRsv,
+                description = str("adv.accurateSpuRsv.description"),
+                notDefault = s.notDefault { it.ps3.accurateSpuRsv },
+            ) { apply(s.copy(ps3 = s.ps3.copy(accurateSpuRsv = it))) }
+            SettingsDivider()
+            ToggleRow(
+                str("adv.accurateCacheLine.label"),
+                s.ps3.accurateCacheLine,
+                description = str("adv.accurateCacheLine.description"),
+                notDefault = s.notDefault { it.ps3.accurateCacheLine },
+            ) { apply(s.copy(ps3 = s.ps3.copy(accurateCacheLine = it))) }
+            SettingsDivider()
+            ToggleRow(
+                str("adv.accurateRsxRsv.label"),
+                s.ps3.accurateRsxRsv,
+                description = str("adv.accurateRsxRsv.description"),
+                notDefault = s.notDefault { it.ps3.accurateRsxRsv },
+            ) { apply(s.copy(ps3 = s.ps3.copy(accurateRsxRsv = it))) }
+            SettingsDivider()
+            ToggleRow(
+                str("adv.ppuRsvPriority.label"),
+                s.ps3.ppuRsvPriority,
+                description = str("adv.ppuRsvPriority.description"),
+                notDefault = s.notDefault { it.ps3.ppuRsvPriority },
+            ) { apply(s.copy(ps3 = s.ps3.copy(ppuRsvPriority = it))) }
+            SettingsDivider()
+            ToggleRow(
+                str("adv.spuVerification.label"),
+                s.ps3.spuVerification,
+                description = str("adv.spuVerification.description"),
+                notDefault = s.notDefault { it.ps3.spuVerification },
+            ) { apply(s.copy(ps3 = s.ps3.copy(spuVerification = it))) }
+            SettingsDivider()
+            // Distinct from the toggle above: that one chooses whether to verify at all, this one
+            // chooses how. The field was already serialised and written to the config tree but had
+            // no control, so the only way to reach it was a raw core override.
+            ToggleRow(
+                str("adv.preciseSpuVerification.label"),
+                s.ps3.preciseSpuVerification,
+                description = str("adv.preciseSpuVerification.description"),
+                notDefault = s.notDefault { it.ps3.preciseSpuVerification },
+            ) { apply(s.copy(ps3 = s.ps3.copy(preciseSpuVerification = it))) }
+        }
+
+        CollapsibleSection(str("adv.section.fpu")) {
+            HelpText(
+                str("adv.section.fpu.help"),
+                modifier = Modifier.padding(horizontal = 6.dp),
+            )
+            ToggleRow(
+                str("adv.ppuNan.label"),
+                s.ps3.ppuNanHandling,
+                description = str("adv.ppuNan.description"),
+                notDefault = s.notDefault { it.ps3.ppuNanHandling },
+            ) { apply(s.copy(ps3 = s.ps3.copy(ppuNanHandling = it))) }
+            SettingsDivider()
+            ToggleRow(
+                str("adv.accurateDfma.label"),
+                s.ps3.accurateDfma,
+                description = str("adv.accurateDfma.description"),
+                notDefault = s.notDefault { it.ps3.accurateDfma },
+            ) { apply(s.copy(ps3 = s.ps3.copy(accurateDfma = it))) }
+            SettingsDivider()
+            ToggleRow(
+                str("adv.dazFtz.label"),
+                s.ps3.setDazFtz,
+                description = str("adv.dazFtz.description"),
+                notDefault = s.notDefault { it.ps3.setDazFtz },
+            ) { apply(s.copy(ps3 = s.ps3.copy(setDazFtz = it))) }
+        }
+
+        CollapsibleSection(str("adv.section.system")) {
+            SegmentedGridRow(
+                label = str("adv.sleepTimers.label"),
+                options = listOf(
+                    str("adv.sleepTimers.asHost"),
+                    str("adv.sleepTimers.usleep"),
+                    str("adv.sleepTimers.all"),
+                ),
+                selectedIndex = s.ps3.sleepTimers.coerceIn(0, 2),
+                columns = 3,
+                description = str("adv.sleepTimers.description"),
+                onChange = { apply(s.copy(ps3 = s.ps3.copy(sleepTimers = it))) },
+                notDefault = s.notDefault { it.ps3.sleepTimers },
+            )
+            SettingsDivider()
+            ToggleRow(
+                str("adv.hleLwmutex.label"),
+                s.ps3.hleLwmutex,
+                description = str("adv.hleLwmutex.description"),
+                notDefault = s.notDefault { it.ps3.hleLwmutex },
+            ) { apply(s.copy(ps3 = s.ps3.copy(hleLwmutex = it))) }
+            SettingsDivider()
+            ToggleRow(
+                str("adv.debugConsole.label"),
+                s.ps3.debugConsoleMode,
+                description = str("adv.debugConsole.description"),
+                notDefault = s.notDefault { it.ps3.debugConsoleMode },
+            ) { apply(s.copy(ps3 = s.ps3.copy(debugConsoleMode = it))) }
+        }
+
+        // How the picture reaches the screen. Pre-rotation (on unless switched off here) draws it
+        // already turned for a screen mounted sideways, a phone held in landscape or a handheld
+        // with a portrait panel, so the system does not turn every frame on the GPU. Vulkan only.
+        CollapsibleSection(str("adv.section.display")) {
+            ToggleRow(
+                str("adv.prerotation.label"),
+                s.ps3.disableSwapchainPrerotation,
+                description = str("adv.prerotation.description"),
+                notDefault = s.notDefault { it.ps3.disableSwapchainPrerotation },
+            ) { apply(s.copy(ps3 = s.ps3.copy(disableSwapchainPrerotation = it))) }
+        }
+
+        // What the emulated console tells games about itself.
+        //
+        // These are not app preferences: a multi-language disc picks its text from the console
+        // language, and region is what makes a title behave as its NTSC or PAL self. Option
+        // labels come from the core's own enum names (the same strings the All Core Settings
+        // screen shows) rather than 60 new translation keys -- they are proper nouns like
+        // "SCEA" and keyboard layout names, which are not usefully translated.
+        CollapsibleSection(str("adv.section.console")) {
+            SegmentedGridRow(
+                label = str("adv.consoleLanguage.label"),
+                options = com.armsx3.Rpcs3Settings.consoleLanguageNames(),
+                selectedIndex = s.ps3.consoleLanguage.coerceIn(0, com.armsx3.Rpcs3Settings.consoleLanguageNames().lastIndex),
+                columns = 2,
+                description = str("adv.consoleLanguage.description"),
+                onChange = { apply(s.copy(ps3 = s.ps3.copy(consoleLanguage = it))) },
+                notDefault = s.notDefault { it.ps3.consoleLanguage },
+            )
+            SettingsDivider()
+            SegmentedGridRow(
+                label = str("adv.consoleRegion.label"),
+                options = com.armsx3.Rpcs3Settings.consoleRegionNames(),
+                selectedIndex = s.ps3.consoleRegion.coerceIn(0, com.armsx3.Rpcs3Settings.consoleRegionNames().lastIndex),
+                columns = 3,
+                description = str("adv.consoleRegion.description"),
+                onChange = { apply(s.copy(ps3 = s.ps3.copy(consoleRegion = it))) },
+                notDefault = s.notDefault { it.ps3.consoleRegion },
+            )
+            SettingsDivider()
+            SegmentedGridRow(
+                label = str("adv.keyboardType.label"),
+                options = com.armsx3.Rpcs3Settings.keyboardTypeNames(),
+                selectedIndex = s.ps3.keyboardType.coerceIn(0, com.armsx3.Rpcs3Settings.keyboardTypeNames().lastIndex),
+                columns = 1,
+                description = str("adv.keyboardType.description"),
+                onChange = { apply(s.copy(ps3 = s.ps3.copy(keyboardType = it))) },
+                notDefault = s.notDefault { it.ps3.keyboardType },
+            )
+            SettingsDivider()
+            SegmentedGridRow(
+                label = str("adv.dateFormat.label"),
+                options = listOf(
+                    str("adv.dateFormat.ymd"),
+                    str("adv.dateFormat.dmy"),
+                    str("adv.dateFormat.mdy"),
+                ),
+                selectedIndex = s.ps3.dateFormat.coerceIn(0, 2),
+                columns = 3,
+                onChange = { apply(s.copy(ps3 = s.ps3.copy(dateFormat = it))) },
+                notDefault = s.notDefault { it.ps3.dateFormat },
+            )
+            SettingsDivider()
+            SegmentedRow(
+                label = str("adv.timeFormat.label"),
+                options = listOf(str("adv.timeFormat.clock12"), str("adv.timeFormat.clock24")),
+                selectedIndex = s.ps3.timeFormat.coerceIn(0, 1),
+                onChange = { apply(s.copy(ps3 = s.ps3.copy(timeFormat = it))) },
+                notDefault = s.notDefault { it.ps3.timeFormat },
+            )
+        }
+
+        DeveloperSection()
+
+        Spacer(Modifier.height(12.dp))
+    }
+}
+
+/**
+ * Tools for chasing graphics bugs: replaying an RSX capture, and choosing what the in-game menu's
+ * Dump this frame saves. App preferences, not core settings, so they hold for every game. See
+ * [DevTools].
+ */
+@Composable
+private fun DeveloperSection() {
+    CollapsibleSection(str("adv.section.developer")) {
+        HelpText(
+            str("adv.section.developer.help"),
+            modifier = Modifier.padding(horizontal = 6.dp),
+        )
+
+        // Listed when the section is drawn, so a capture made since shows up on the next visit.
+        val captures = remember { DevTools.captures() }
+        // In the XMB: Replay a Capture as a list of the captures, newest first, each replayed with
+        // Cross; and over a game, Capture RSX Frame and Dump This Frame, as the pause menu has them.
+        com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+            val replayTitle = str("adv.replayCapture.label")
+            val none = str("adv.replayCapture.none")
+            val count = if (captures.isEmpty()) none else str("adv.replayCapture.count").replace("%d", captures.size.toString())
+            com.armsx2.ui.xmb.XmbCollected(
+                c,
+                com.armsx2.ui.xmb.XmbNode.Folder("xmb.replayCapture", replayTitle, c.icon, count, live = true) {
+                    val now = DevTools.captures()
+                    if (now.isEmpty()) {
+                        listOf(com.armsx2.ui.xmb.XmbNode.Action("xmb.replayCapture.none", none, c.icon) {})
+                    } else {
+                        now.map { f ->
+                            com.armsx2.ui.xmb.XmbNode.Action(
+                                "xmb.replay.${f.name}", f.name.substringBefore('.'), c.icon,
+                                java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(f.lastModified())) +
+                                    "   " + "%.1f MB".format(f.length() / 1048576.0),
+                            ) { DevTools.replay(f) }
+                        }
+                    }
+                },
+            )
+            if (com.armsx2.runtime.MainActivityRuntime.currentGame.value != null) {
+                val rsx = str("capture.rsx")
+                val rsxArmed = str("capture.rsx.armed")
+                val rsxDetail = str("capture.rsx.detail")
+                val dump = str("capture.frameDump")
+                val dumpArmed = str("capture.frameDump.armed")
+                val dumpUnsupported = str("capture.frameDump.unsupported")
+                val dumpDetail = str("capture.frameDump.detail")
+                val ok = str("action.ok")
+                com.armsx2.ui.xmb.XmbCollected(
+                    c,
+                    com.armsx2.ui.xmb.XmbNode.Action("xmb.capture.rsx", rsx, c.icon, rsxDetail) {
+                        com.armsx3.Rpcs3Bridge.captureFrame()
+                        com.armsx2.ui.xmb.XmbDialogs.target()?.tell(rsxArmed, ok)
+                    },
+                )
+                com.armsx2.ui.xmb.XmbCollected(
+                    c,
+                    com.armsx2.ui.xmb.XmbNode.Action("xmb.capture.dump", dump, c.icon, dumpDetail) {
+                        val armed = com.armsx3.Rpcs3Bridge.dumpFrame(DevTools.frameDumpMode)
+                        com.armsx2.ui.xmb.XmbDialogs.target()?.tell(if (armed) dumpArmed else dumpUnsupported, ok)
+                    },
+                )
+            }
+        }
+        if (com.armsx2.ui.xmb.LocalXmbCollector.current == null) DevActionRow(
+            label = str("adv.replayCapture.label"),
+            description = if (captures.isEmpty()) str("adv.replayCapture.none")
+            else str("adv.replayCapture.count").replace("%d", captures.size.toString()),
+            controllerId = "adv.replayCapture",
+            enabled = captures.isNotEmpty(),
+        ) {
+            // I18n.get, not str(): this runs in a click handler, outside composition.
+            GlobalConfirm.ask(
+                title = I18n.get("adv.replayCapture.label"),
+                message = I18n.get("adv.replayCapture.message"),
+                confirmLabel = I18n.get("adv.replayCapture.newest"),
+                extra = { layer -> CaptureList(layer, captures) },
+                onConfirm = { DevTools.replay(captures.first()) },
+            )
+        }
+
+        SettingsDivider()
+
+        var dumpMode by remember { mutableStateOf(DevTools.frameDumpMode) }
+        SegmentedRow(
+            label = str("adv.frameDump.label"),
+            options = listOf(str("adv.frameDump.final"), str("adv.frameDump.passes")),
+            selectedIndex = if (dumpMode == DevTools.DUMP_EVERY_PASS) 1 else 0,
+            description = str("adv.frameDump.description"),
+        ) {
+            dumpMode = if (it == 1) DevTools.DUMP_EVERY_PASS else DevTools.DUMP_FINAL_IMAGE
+            DevTools.frameDumpMode = dumpMode
+        }
+    }
+}
+
+/** A row that does something when chosen, styled like [ToggleRow] without the switch. */
+@Composable
+private fun DevActionRow(
+    label: String,
+    description: String,
+    controllerId: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val click = { if (enabled) onClick() }
+    Surface(
+        onClick = click,
+        enabled = enabled,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 5.dp)
+            .controllerFocusable(controllerId = controllerId, onConfirm = click),
+        shape = RoundedCornerShape(22.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.72f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.46f)),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .defaultMinSize(minHeight = 78.dp)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(label, color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp, lineHeight = 23.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    description,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 14.sp,
+                    lineHeight = 19.sp,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (enabled) {
+                Spacer(Modifier.width(12.dp))
+                Text("\u203a", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 26.sp)
+            }
+        }
+    }
+}
+
+/**
+ * The captures to pick from, inside the replay prompt. Every row registers under the prompt's
+ * controller [layer], or the pad could not reach it.
+ */
+@Composable
+private fun CaptureList(layer: String, captures: List<File>) {
+    val format = remember { java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT) }
+    Column(
+        Modifier
+            .heightIn(max = 300.dp)
+            .verticalScroll(rememberScrollState()),
+    ) {
+        // The newest twenty: older ones are still there to pull off the card, and a list longer
+        // than this is no easier to pick from.
+        captures.take(20).forEachIndexed { index, file ->
+            val pick = {
+                GlobalConfirm.dismiss()
+                DevTools.replay(file)
+            }
+            Surface(
+                onClick = pick,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 3.dp)
+                    .controllerFocusable(controllerId = "$layer.capture.$index", layer = layer, onConfirm = pick),
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+            ) {
+                Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                    Text(
+                        file.name,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${format.format(java.util.Date(file.lastModified()))}  \u00b7  ${"%.1f".format(file.length() / 1048576.0)} MB",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+// CollapsibleSection now lives in SettingsWidgets.kt (shared by the Fixes / Pad /
+// Performance / Renderer tabs).
+
+/** The former standalone Recompiler tab, folded in as a section. Turning a recompiler off drops
+ *  that processor to an interpreter — correct but far slower — so it is a debugging control, not
+ *  something to browse past on the way to a speed setting. */
+@Composable
+private fun RecompilerSection(state: MutableState<Settings>) {
+    val settings = state.value
+    fun apply(updated: Settings) = InGameOverlay.saveSettings(updated)
+
+    CollapsibleSection(str("tab.recompiler")) {
+        Text(
+            str("jit.recompiler.warning"),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+        )
+        ToggleRow("EE (R5900)", settings.recEE) { apply(settings.copy(recEE = it)) }
+        ToggleRow("IOP (R3000)", settings.recIOP) { apply(settings.copy(recIOP = it)) }
+        ToggleRow("VU0", settings.recVU0) { apply(settings.copy(recVU0 = it)) }
+        ToggleRow("VU1", settings.recVU1) { apply(settings.copy(recVU1 = it)) }
+        ToggleRow("Fastmem", settings.enableFastmem) { apply(settings.copy(enableFastmem = it)) }
+    }
+}

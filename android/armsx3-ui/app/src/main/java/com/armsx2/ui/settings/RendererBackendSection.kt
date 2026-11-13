@@ -1,0 +1,107 @@
+package com.armsx2.ui.settings
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.armsx2.CustomDriver
+import com.armsx2.config.Settings
+import com.armsx2.runtime.MainActivityRuntime
+import com.armsx2.ui.InGameOverlay
+import com.armsx2.ui.common.SectionTitle
+import com.armsx2.ui.common.StatusChip
+import com.armsx2.ui.theme.Success
+import com.armsx2.i18n.str
+
+@Composable
+fun RendererBackendSection(state: MutableState<Settings>) {
+    val settings = state.value
+    // In the XMB over a game: a change of API or driver asks straight away whether to restart the
+    // game with it, as it only takes effect then.
+    if (com.armsx2.ui.xmb.LocalXmbCollector.current != null && MainActivityRuntime.currentGame.value != null) {
+        val choice = Triple(settings.renderer, settings.customDriverId, settings.useAngleOpenGL)
+        val asked = androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf(choice) }
+        val title = str("backend.applyRestart")
+        val message = str("xmb.restartToApply")
+        val later = str("xmb.later")
+        LaunchedEffect(choice) {
+            if (choice == asked.value) return@LaunchedEffect
+            asked.value = choice
+            com.armsx2.ui.xmb.XmbDialogs.target()?.let { x ->
+                com.armsx2.ui.xmb.XmbDialogs.ask(x, title, message, title, later, {
+                    if (com.armsx2.ui.WindowImpl.overlayVisible.value) InGameOverlay.toggle()
+                    MainActivityRuntime.restart()
+                }, {})
+            }
+        }
+    }
+    // No Software: RPCS3 has no PS3 software renderer (that was ARMSX2's PCSX2 one). A title
+    // still saved with it boots Vulkan, and shows here as Auto, which is the same thing.
+    val rendererIds = listOf("auto", "opengl", "vulkan")
+    SegmentedRow(
+        label = str("backend.graphicsApi.label"),
+        options = listOf(str("backend.renderer.auto"), "OpenGL", "Vulkan"),
+        selectedIndex = rendererIds.indexOf(settings.renderer).coerceAtLeast(0),
+        // The Vulkan driver pick stays when another renderer is chosen. Clearing it here (an ARMSX2
+        // leftover) put a game back on the stock driver the moment someone tried OpenGL, and
+        // OpenGL never uses it.
+        onChange = { index ->
+            val renderer = rendererIds[index]
+            InGameOverlay.saveSettings(settings.copy(renderer = renderer))
+            MainActivityRuntime.renderer.value = renderer
+        },
+        notDefault = settings.notDefault { it.renderer },
+    )
+
+    if (settings.renderer == "vulkan") {
+        SettingsDivider()
+        com.armsx2.ui.common.DriverManagerSection()
+    } else if (settings.renderer == "opengl") {
+        // OpenGL's "custom driver" is ANGLE — the GL analogue of the Vulkan driver list.
+        SettingsDivider()
+        com.armsx2.ui.common.AngleDriverSection(settings.useAngleOpenGL) { on ->
+            InGameOverlay.saveSettings(settings.copy(useAngleOpenGL = on))
+        }
+    }
+
+    // GPU Turbo used to live here, on the reasoning that it belongs with the driver. It does
+    // technically -- it is a KGSL ioctl, not an emulator setting -- but the driver picker sits
+    // inside "Display & Resolution", so the net effect was a power/thermal lever filed under
+    // display options where nobody could find it. It is on the Performance tab now.
+
+    SettingsDivider()
+    // In the XMB: Apply and Restart while a game runs, the only time it does anything.
+    com.armsx2.ui.xmb.LocalXmbCollector.current?.let { c ->
+        if (MainActivityRuntime.currentGame.value != null) {
+            com.armsx2.ui.xmb.XmbCollected(
+                c,
+                com.armsx2.ui.xmb.XmbNode.Action("xmb.backend.restart", str("backend.applyRestart"), c.icon) {
+                    if (com.armsx2.ui.WindowImpl.overlayVisible.value) com.armsx2.ui.InGameOverlay.toggle()
+                    MainActivityRuntime.restart()
+                },
+            )
+        }
+        return
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.End,
+    ) {
+        OutlinedButton(onClick = MainActivityRuntime::restart, shape = RoundedCornerShape(13.dp)) {
+            Text(str("backend.applyRestart"))
+        }
+    }
+}

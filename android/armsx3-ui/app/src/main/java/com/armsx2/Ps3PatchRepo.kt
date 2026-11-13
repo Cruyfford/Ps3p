@@ -1,0 +1,1029 @@
+package com.armsx2
+
+import android.content.Context
+import com.armsx3.core.ARMSX3
+import org.json.JSONArray
+
+/**
+ * RPCS3 per-game patches and graphics mods.
+ *
+ * RPCS3 keeps two YAML files: `patches/patch.yml` (the database) and
+ * `patch_config.yml` (which patches are on, keyed hash -> description -> title
+ * -> serial -> app_version). Both have a fiddly nested shape that patch_engine
+ * already parses and writes, so all of that stays in the core -- this only
+ * downloads the bytes and renders what the core reports back.
+ *
+ * Reimplementing the YAML here would mean a second parser to keep in step with
+ * upstream, and a format drift would silently disable people's patches.
+ */
+object Ps3PatchRepo {
+
+    /**
+     * RPCS3's official patch feed. `v` is the patch-engine version the server
+     * uses to decide which schema to hand back, so it is not cosmetic -- an
+     * older value returns patches this core cannot parse.
+     *
+     * The version comes from the core (patch_engine_version) rather than being
+     * written here. It was spelled out as 1.2, which is correct only until
+     * upstream bumps the constant: patch_engine::load rejects any file whose
+     * Version header does not match, so the two have to move together.
+     */
+    /** Asked for the current release rather than a pinned asset url, which would rot. */
+    private const val ARTEMIS_LATEST_RELEASE =
+        "https://api.github.com/repos/chidreams/Artemis-Patch-Collection-Android/releases/latest"
+
+    private fun patchUrl(version: String) =
+        "https://rpcs3.net/compatibility?patch&api=v1&v=$version"
+
+    // One file per source under config/patches (the layout is described where the core writes
+    // them, in armsx3-core.cpp). Each download replaces its own file whole, so whatever its
+    // source renamed or withdrew is gone after the next download instead of listed beside its
+    // replacement; only the user's own imports (imported_patch.yml) accumulate.
+    private const val DB_FILE = "patch.yml"
+    private const val ARTEMIS_FILE = "artemis_patch.yml"
+    private const val BUNDLED_FILE = "armsx3_patch.yml"
+
+    /** The old merged patch.yml, kept once when the files are first split. */
+    private const val PRE_SPLIT_BACKUP = "patch.yml.pre-1.0"
+
+    private const val KEY_FILES_SPLIT = "ps3_patch_files_split"
+
+    private fun patchesDir() = java.io.File(ARMSX3.rootDirectory, "config/patches")
+
+    private fun prefs(context: Context) =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    /**
+     * Get an install that still has one merged patch.yml ready to have it replaced.
+     *
+     * Until 1.0 every source was merged into patch.yml: the database, the Artemis collection,
+     * the bundled fixes and anything the user imported, with nothing recording which was which.
+     * So there is no taking the old file apart; it is replaced by the first download, which is
+     * the clean baseline the Artemis maintainer asked for. Two things are done first, once:
+     * the bundled fixes get their own file (switched on but in no file, a patch is simply not
+     * applied), and the old file is kept beside it for anyone who had imported patches of their
+     * own into it. Returns whether there was an old list to keep, which is when the user is told.
+     */
+    private fun prepareSplit(context: Context): Boolean {
+        ensureBundledPatches(context)
+        return runCatching {
+            val old = java.io.File(patchesDir(), DB_FILE)
+            val backup = java.io.File(patchesDir(), PRE_SPLIT_BACKUP)
+            if (!old.isFile) return@runCatching false
+            if (!backup.exists()) old.copyTo(backup)
+            true
+        }.getOrElse {
+            android.util.Log.w("ARMSX3", "patches: could not keep the old patch.yml", it)
+            false
+        }
+    }
+
+    data class Patch(
+        val hash: String,
+        val name: String,
+        val author: String,
+        val notes: String,
+        val version: String,
+        val appVersion: String,
+        val game: String,
+        val enabled: Boolean,
+    )
+
+    /** Distinguishes the failure modes so the UI can say which one happened. [Ok.rebuilt] is
+     *  set on the one download that replaced an old merged patch.yml (see [prepareSplit]). */
+    sealed interface Result {
+        data class Ok(val count: Int, val rebuilt: Boolean = false) : Result
+        data object Network : Result
+        data class Server(val code: Int) : Result
+        data object Parse : Result
+        data object Checksum : Result
+    }
+
+    /**
+     * Download the patch database into patches/patch.yml, replacing it.
+     *
+     * Replaced rather than merged, as desktop RPCS3 does: a merge only ever adds, so a patch
+     * the database renamed or withdrew stayed listed forever. Hand-added patches are not in this
+     * file any more (they merge into imported_patch.yml), so replacing it costs nobody anything.
+     */
+    fun download(context: Context): Result {
+        val engineVersion = runCatching { ARMSX3.instance.patchEngineVersion() }.getOrDefault("")
+        if (engineVersion.isBlank()) return Result.Parse
+
+        val res = runCatching {
+            com.armsx3.HttpClient.doRequest(patchUrl(engineVersion), userAgent = "ARMSX3")
+        }.getOrNull() ?: return Result.Network
+
+        if (res.statusCode != 200 || res.data.isEmpty()) return Result.Network
+
+        // The endpoint returns a JSON ENVELOPE, not raw YAML:
+        //   { "return_code": 0, "version": "1.2", "sha256": "...", "patch": "<yaml>" }
+        // Handing the envelope straight to the YAML parser fails on the first
+        // line, which is exactly what it did.
+        val envelope = runCatching {
+            val obj = org.json.JSONObject(String(res.data, Charsets.UTF_8))
+            val code = obj.optInt("return_code", -1)
+            if (code != 0) return Result.Server(code)
+            obj
+        }.getOrNull() ?: return Result.Parse
+
+        // The server picks the schema from the version we asked for, so a reply
+        // for a different one is a server-side surprise rather than something to
+        // hand to the parser: patch_engine::load would reject the whole file on
+        // its Version header anyway, several megabytes later.
+        if (envelope.optString("version") != engineVersion) return Result.Parse
+
+        val yaml = envelope.optString("patch")
+        if (yaml.isBlank()) return Result.Parse
+
+        // Desktop RPCS3 verifies this digest before it writes anything
+        // (patch_manager_dialog::handle_json), and the check was missing here.
+        // Patches are writes into the guest executable, and move_file/hide_file
+        // patches reach the emulator's own filesystem, so content that is not
+        // what the server hashed does not get imported.
+        val expected = envelope.optString("sha256")
+        if (!expected.equals(sha256(yaml), ignoreCase = true)) return Result.Checksum
+
+        val splitting = !prefs(context).getBoolean(KEY_FILES_SPLIT, false)
+        val keptOldList = splitting && prepareSplit(context)
+
+        val n = runCatching { ARMSX3.instance.patchesWrite(DB_FILE, yaml) }.getOrDefault(-1)
+        if (n < 0) return Result.Parse
+        if (splitting) prefs(context).edit().putBoolean(KEY_FILES_SPLIT, true).apply()
+        return Result.Ok(n, rebuilt = keptOldList)
+    }
+
+    /**
+     * The Artemis collection, a second source of patches.
+     *
+     * Maintained by @chidreams. Taken from github.com/chidreams/Artemis-Patch-Collection-Android,
+     * the edition they publish for ARMSX3 and asked us to use: their workflow copies
+     * imported_patch.yml from the main branch of Artemis-Patch-Collection-RPCS3 and releases it,
+     * so it carries the same patches without waiting for that repo's own releases. All this does
+     * is download their work; the cheats, the testing and the upkeep are theirs.
+     *
+     * Community cheats, MIT licensed, and already in RPCS3's own patch format: PPU hash keyed,
+     * with `[ be32, addr, value ]` entries. No conversion step. It gets a file of its own,
+     * patches/artemis_patch.yml, replaced whole by every download: the maintainer renames and
+     * retires patches between releases, and merged into patch.yml (as it was until 1.0) the old
+     * names stayed listed beside the new ones for good.
+     *
+     * The release ASSET is asked for rather than hardcoded. It is attached to a GitHub release and
+     * the tag moves, so a pinned url would rot the first time they publish. Asking the API which
+     * asset is current costs one small request and survives that. Either packaging is taken: the
+     * RPCS3 repo released a zip holding the yml up to v1.04bfu and the bare imported_patch.yml
+     * from v2026.09.19, which is also what the Android edition releases. Accepting only the zip
+     * is what broke the button the day they switched.
+     *
+     * No checksum to verify: unlike rpcs3.net there is no published digest to compare against.
+     * The transport is https and the core parses the result, so a corrupt file is rejected
+     * rather than half applied, which is the same guarantee [importLocal] gives.
+     */
+    fun downloadArtemis(context: Context): Result {
+        // An install that has not been split yet may hold an older copy of the collection merged
+        // into patch.yml, and writing the new one to its own file would list every renamed patch
+        // twice. So the database is refreshed first, once, which replaces that copy.
+        var rebuilt = false
+        if (!prefs(context).getBoolean(KEY_FILES_SPLIT, false)) {
+            val db = download(context)
+            if (db !is Result.Ok) return db
+            rebuilt = db.rebuilt
+        }
+
+        val meta = runCatching {
+            com.armsx3.HttpClient.doRequest(ARTEMIS_LATEST_RELEASE, userAgent = "ARMSX3")
+        }.getOrNull() ?: return Result.Network
+
+        if (meta.statusCode != 200 || meta.data.isEmpty()) {
+            return if (meta.statusCode > 0) Result.Server(meta.statusCode) else Result.Network
+        }
+
+        // The yml itself if the release has one, else a zip to take it out of. Anything else (the
+        // oldest releases were rars) is not readable here; say so in the log, because the UI can
+        // only report it as a file that could not be read.
+        val assets = runCatching {
+            val list = org.json.JSONObject(String(meta.data, Charsets.UTF_8)).getJSONArray("assets")
+            (0 until list.length()).map { list.getJSONObject(it) }
+        }.getOrNull() ?: return Result.Parse
+
+        fun assetWith(vararg extensions: String) = assets
+            .firstOrNull { a -> extensions.any { a.optString("name").endsWith(it, ignoreCase = true) } }
+            ?.optString("browser_download_url")
+            ?.takeIf { it.isNotBlank() }
+
+        val ymlUrl = assetWith(".yml", ".yaml")
+        val assetUrl = ymlUrl ?: assetWith(".zip") ?: run {
+            android.util.Log.w("ARMSX3", "artemis: no .yml or .zip asset in the latest release: " +
+                assets.joinToString { it.optString("name") })
+            return Result.Parse
+        }
+
+        // Longer than the default: this is a whole collection, not one game's patches, and it
+        // arrives over a link the user did not choose the speed of.
+        val archive = runCatching {
+            com.armsx3.HttpClient.doRequest(assetUrl, userAgent = "ARMSX3", timeoutMs = 60_000)
+        }.getOrNull() ?: return Result.Network
+
+        if (archive.statusCode != 200 || archive.data.isEmpty()) {
+            return if (archive.statusCode > 0) Result.Server(archive.statusCode) else Result.Network
+        }
+
+        val yaml = if (ymlUrl != null) String(archive.data, Charsets.UTF_8) else runCatching {
+            java.util.zip.ZipInputStream(archive.data.inputStream()).use { zip ->
+                var found: String? = null
+                while (found == null) {
+                    val entry = zip.nextEntry ?: break
+                    if (!entry.isDirectory && entry.name.endsWith(".yml", ignoreCase = true)) {
+                        found = zip.readBytes().toString(Charsets.UTF_8)
+                    }
+                }
+                found
+            }
+        }.getOrNull()
+
+        if (yaml.isNullOrBlank()) return Result.Parse
+
+        val n = runCatching { ARMSX3.instance.patchesWrite(ARTEMIS_FILE, yaml) }.getOrDefault(-1)
+        return if (n >= 0) Result.Ok(n, rebuilt) else Result.Parse
+    }
+
+    /**
+     * Import a patch.yml the user picked themselves.
+     *
+     * No checksum here, unlike [download]: there is no publisher digest to compare a
+     * local file against, and the user choosing the file IS the trust decision. The
+     * core still parses it, so a malformed file is rejected rather than half-applied.
+     *
+     * Merges into patches/imported_patch.yml, RPCS3's own file for these, so hand-added
+     * patches accumulate there and no download ever replaces them.
+     */
+    fun importLocal(context: Context, uri: android.net.Uri): Result {
+        val yaml = runCatching {
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                stream.bufferedReader().readText()
+            }
+        }.getOrNull()
+
+        if (yaml.isNullOrBlank()) return Result.Network
+        val n = runCatching { ARMSX3.instance.patchesImport(yaml) }.getOrDefault(-1)
+        return if (n >= 0) Result.Ok(n) else Result.Parse
+    }
+
+    /** Lowercase hex SHA-256, the form rpcs3.net sends and desktop compares against. */
+    private fun sha256(text: String): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(text.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+
+    /**
+     * Patches applicable to a serial. An empty serial lists everything, which is
+     * what the standalone tab shows when no game is selected.
+     */
+    fun list(serial: String): List<Patch> = runCatching {
+        val arr = JSONArray(ARMSX3.instance.patchesList(serial))
+        (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            Patch(
+                hash = o.optString("hash"),
+                name = o.optString("name"),
+                author = o.optString("author"),
+                notes = o.optString("notes"),
+                version = o.optString("version"),
+                appVersion = o.optString("appVersion", "all"),
+                game = o.optString("game"),
+                enabled = o.optBoolean("enabled"),
+            )
+        }
+    }.getOrDefault(emptyList())
+
+    fun setEnabled(patch: Patch, serial: String, enabled: Boolean): Boolean =
+        runCatching {
+            ARMSX3.instance.patchSetEnabled(
+                patch.hash, patch.name, serial, patch.appVersion, enabled,
+            )
+        }.getOrDefault(false)
+
+    // ---------------------------------------------------------------
+    // Bundled canary patches
+    // ---------------------------------------------------------------
+
+    /**
+     * A patch shipped in assets/canary_patches.yml, and the game it belongs to.
+     *
+     * `hash` and `name` are the two keys patchSetEnabled looks up, and they must
+     * match the YAML exactly: the top-level `PPU-...` key (prefix included) and
+     * the patch's name key under it. A mismatch is not an error the user can see
+     * -- the import still succeeds and the patch just never turns on -- so these
+     * are asserted against the YAML in the comment above each entry.
+     *
+     * appVersion is carried for symmetry with [Patch]; the native side matches on
+     * serial and ignores it.
+     *
+     * sinceRevision is the [BUNDLED_REVISION] this entry first shipped in. It is what
+     * keeps a bump from touching the patches that were already here: an install whose
+     * stored revision is at or above it has been offered this patch once already, and
+     * whatever the user did with the toggle afterwards is their answer.
+     *
+     * The exception is 14. Until then patchSetEnabled kept only the LAST serial of a patch
+     * enabled for several serials in a row (armsx3-core.cpp explains why), so every
+     * earlier serial of such a group was never actually turned on, whatever the stored
+     * revision says. Those entries are offered again at 14; the last of each group keeps
+     * its original revision, since that one did turn on and a user's OFF there is real.
+     */
+    private data class Bundled(
+        val hash: String,
+        val name: String,
+        val serial: String,
+        val appVersion: String,
+        val sinceRevision: Int,
+    ) {
+        /** Identifies this entry in [KEY_BUNDLED_RETRY]. */
+        val key: String get() = "$hash|$name|$serial"
+    }
+
+    private val BUNDLED = listOf(
+        // BLITZ: THE LEAGUE II, BLUS30203 -- ours. Its three raw SPUs park themselves when a loop
+        // counter reaches a limit, which here runs out mid-load, and nothing restarts them; the
+        // patch makes each loop skip the count, as it does when there is no limit. Two programs,
+        // one entry per program and serial. BLES00397 untested: the patch only applies if its
+        // programs hash the same.
+        // See canary_patches.yml.
+        Bundled(
+            hash = "SPU-30d17ae952dd9ccc1abc46b631654e1fe432fde9",
+            name = "ARMSX3 raw SPU park fix",
+            serial = "BLUS30203",
+            appVersion = "All",
+            sinceRevision = 18,
+        ),
+        Bundled(
+            hash = "SPU-30d17ae952dd9ccc1abc46b631654e1fe432fde9",
+            name = "ARMSX3 raw SPU park fix",
+            serial = "BLES00397",
+            appVersion = "All",
+            sinceRevision = 18,
+        ),
+        Bundled(
+            hash = "SPU-93f3b15e03c594d9eaf5a0d8521854fd6eb2a8c7",
+            name = "ARMSX3 raw SPU park fix",
+            serial = "BLUS30203",
+            appVersion = "All",
+            sinceRevision = 18,
+        ),
+        Bundled(
+            hash = "SPU-93f3b15e03c594d9eaf5a0d8521854fd6eb2a8c7",
+            name = "ARMSX3 raw SPU park fix",
+            serial = "BLES00397",
+            appVersion = "All",
+            sinceRevision = 18,
+        ),
+        // THE IDOLM@STER 2, NPJB00337 v01.00 -- ours. A scene change frees objects that the draw
+        // thread is still drawing from last frame's list, which holds them without a reference;
+        // the frame's draw kick now waits for that list to be drawn. See canary_patches.yml.
+        Bundled(
+            hash = "PPU-f942422316f63af3d64dc940b35ec8fddade0f44",
+            name = "ARMSX3 boot crash fix",
+            serial = "NPJB00337",
+            appVersion = "01.00",
+            sinceRevision = 16,
+        ),
+        // GRAND THEFT AUTO IV, BLUS30682 v01.02 and the same executable as BLUS30127 / NPUB30702
+        // v01.08 -- ours. The collision job seeds its distances with the SPU's largest float,
+        // which is a NaN on Approximate, so the first convergence test fails and Niko falls
+        // through the world; the patch uses FLT_MAX instead. ConfigDatabase.LOCAL_OVERRIDES puts
+        // these three serials on Approximate, which relies on this being on. See canary_patches.yml.
+        Bundled(
+            hash = "SPU-d0a1508208613e2184fbd64906d34d5f07890033",
+            name = "ARMSX3 Approximate collision fix",
+            serial = "BLUS30682",
+            appVersion = "All",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "SPU-d0a1508208613e2184fbd64906d34d5f07890033",
+            name = "ARMSX3 Approximate collision fix",
+            serial = "BLUS30127",
+            appVersion = "All",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "SPU-d0a1508208613e2184fbd64906d34d5f07890033",
+            name = "ARMSX3 Approximate collision fix",
+            serial = "NPUB30702",
+            appVersion = "All",
+            sinceRevision = 13,
+        ),
+        // SPLATTERHOUSE, BLUS30335 and BLES01120 (one executable) -- ours. When a phase starts
+        // the game queues SPU jobs faster than its 8 job slots come back, gets a NULL slot and
+        // crashes on it; the allocator now runs the game's own dispatcher and retries instead.
+        // Needs the arm64 far-jump fix in PPUThread.cpp. See canary_patches.yml.
+        Bundled(
+            hash = "PPU-0e747cbf4d807d363b085d983fff749c2c9cbdee",
+            name = "ARMSX3 phase start crash fix",
+            serial = "BLUS30335",
+            appVersion = "All",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-0e747cbf4d807d363b085d983fff749c2c9cbdee",
+            name = "ARMSX3 phase start crash fix",
+            serial = "BLES01120",
+            appVersion = "All",
+            sinceRevision = 12,
+        ),
+        // NBA 08, BCES00112 v01.00 -- ours. The quickplay loading screen's Lua misses its one
+        // "exit after this loop" event when loading beats the screen's 6.5 s intro, which it
+        // always does here and never on a PS3; the loading thread now re-sends it every frame.
+        // See canary_patches.yml.
+        Bundled(
+            hash = "PPU-30ce8c9f0a9552914275c90e2980749630f3ea18",
+            name = "ARMSX3 quickplay loading fix",
+            serial = "BCES00112",
+            appVersion = "01.00",
+            sinceRevision = 7,
+        ),
+        // NBA 08, BCES00112 v01.00 -- ours. The intro movie's vdec callback reads a picture
+        // that cellVdecGetPicItem did not hand over (a late PICOUT on a first run, while the
+        // SPU cache compiles); the patch drops that one picture instead of reading NULL+0x44.
+        // See canary_patches.yml.
+        Bundled(
+            hash = "PPU-30ce8c9f0a9552914275c90e2980749630f3ea18",
+            name = "ARMSX3 intro movie crash fix",
+            serial = "BCES00112",
+            appVersion = "01.00",
+            sinceRevision = 6,
+        ),
+        // BURNOUT PARADISE, BLUS30061 v01.00 -- ours. The audio voice refill asks the heap
+        // for a 1.67GB buffer and gets a correct refusal, then writes through the null; and a
+        // lookup miss further on takes a null-check branch that dereferences the null anyway.
+        // Deterministic crash in the intro before, reaches the open world after. See
+        // canary_patches.yml.
+        Bundled(
+            hash = "PPU-56101fbdbac186fddef72207145015fd314a0be5",
+            name = "ARMSX3 Junkyard crash fix",
+            serial = "BLUS30061",
+            appVersion = "01.00",
+            sinceRevision = 6,
+        ),
+        // SOULCALIBUR V, BLUS30736 v01.00 -- illusion's "Disable MLAA". Without it the
+        // title runs at ~1 fps and wedges; with it, ~56-60 fps at the menu. This is a
+        // WORKAROUND: the underlying SPU synchronisation defect is still undiagnosed, and
+        // the patch only sidesteps it by stopping the game issuing the MLAA job.
+        // Confirmed on an Odin 3 (Snapdragon 8 Elite). See canary_patches.yml.
+        Bundled(
+            hash = "PPU-aa798f32a1fda1c23a20066edb1c623c486d53cc",
+            name = "Disable MLAA",
+            serial = "BLUS30736",
+            appVersion = "01.00",
+            sinceRevision = 5,
+        ),
+        // GRAN TURISMO 6 v01.22, BCUS99247 and BCUS98296 -- illusion's "Disable MLAA" and
+        // "Disable Motion Blur", brought to ARMSX3 by mlgprorektm8. Without the first the game
+        // needs Write and Read Color Buffers to render right, and the core turns both off while it
+        // is applied; without the second replays and track intros are black. Keyed by
+        // executable: every GT6 v01.22 executable we know of. See canary_patches.yml.
+        Bundled(
+            hash = "PPU-42367707f4caac2668f10cb46498f64bde9db440",
+            name = "Disable MLAA",
+            serial = "BCUS99247",
+            appVersion = "01.22",
+            sinceRevision = 9,
+        ),
+        Bundled(
+            hash = "PPU-42367707f4caac2668f10cb46498f64bde9db440",
+            name = "Disable Motion Blur",
+            serial = "BCUS99247",
+            appVersion = "01.22",
+            sinceRevision = 9,
+        ),
+        Bundled(
+            hash = "PPU-4f1e9acd7d98961b4b742fb324a2faba6212ea67",
+            name = "Disable MLAA",
+            serial = "BCUS98296",
+            appVersion = "01.22",
+            sinceRevision = 9,
+        ),
+        Bundled(
+            hash = "PPU-4f1e9acd7d98961b4b742fb324a2faba6212ea67",
+            name = "Disable Motion Blur",
+            serial = "BCUS98296",
+            appVersion = "01.22",
+            sinceRevision = 9,
+        ),
+        Bundled(
+            hash = "PPU-6ac472e1f334f54ec4753cde9e8e1515bfab4d17",
+            name = "Disable MLAA",
+            serial = "BCUS98296",
+            appVersion = "01.22",
+            sinceRevision = 10,
+        ),
+        Bundled(
+            hash = "PPU-6ac472e1f334f54ec4753cde9e8e1515bfab4d17",
+            name = "Disable Motion Blur",
+            serial = "BCUS98296",
+            appVersion = "01.22",
+            sinceRevision = 10,
+        ),
+        Bundled(
+            hash = "PPU-638ef307e2b35d593f599efec0dc0c37059a984b",
+            name = "Disable MLAA",
+            serial = "BCES01893",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        Bundled(
+            hash = "PPU-638ef307e2b35d593f599efec0dc0c37059a984b",
+            name = "Disable Motion Blur",
+            serial = "BCES01893",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        Bundled(
+            hash = "PPU-80f0d67b29d3d17ac885a309a3fc4cd8dcf50658",
+            name = "Disable MLAA",
+            serial = "NPEA00502",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        Bundled(
+            hash = "PPU-80f0d67b29d3d17ac885a309a3fc4cd8dcf50658",
+            name = "Disable Motion Blur",
+            serial = "NPEA00502",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        Bundled(
+            hash = "PPU-4213aba5ed17f7e3cd3f299fa44d9d9acef0ba18",
+            name = "Disable MLAA",
+            serial = "NPUA81049",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        Bundled(
+            hash = "PPU-4213aba5ed17f7e3cd3f299fa44d9d9acef0ba18",
+            name = "Disable Motion Blur",
+            serial = "NPUA81049",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        Bundled(
+            hash = "PPU-6a7de7fdfd7e7cbd1031bf28a7104b29c308136c",
+            name = "Disable MLAA",
+            serial = "NPHA80269",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        Bundled(
+            hash = "PPU-6a7de7fdfd7e7cbd1031bf28a7104b29c308136c",
+            name = "Disable Motion Blur",
+            serial = "NPHA80269",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        Bundled(
+            hash = "PPU-43e618448eed82aa96856338d072f1e4978c36a8",
+            name = "Disable MLAA",
+            serial = "NPJA00113",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        Bundled(
+            hash = "PPU-43e618448eed82aa96856338d072f1e4978c36a8",
+            name = "Disable Motion Blur",
+            serial = "NPJA00113",
+            appVersion = "01.22",
+            sinceRevision = 11,
+        ),
+        // SONIC THE HEDGEHOG (2006), BLUS30008 v01.01 -- without this the game
+        // renders only its HUD and skybox. See canary_patches.yml.
+        Bundled(
+            hash = "PPU-4b46d0161ca657ab16b0a779d9062810ea5ea2dd",
+            name = "Graphics Fix",
+            serial = "BLUS30008",
+            appVersion = "01.01",
+            sinceRevision = 1,
+        ),
+        // Tom Clancy's H.A.W.X. 2, BLES00928 -- without this the game hangs forever at
+        // the first intro video with a dead SPU. See canary_patches.yml.
+        Bundled(
+            hash = "SPU-42bae8e5d6a9304068ba1c6bbfdc18d656e287a1",
+            name = "Bink overlay skip",
+            serial = "BLES00928",
+            appVersion = "All",
+            sinceRevision = 2,
+        ),
+        // RATCHET & CLANK -- every game in the family hangs without its freeze fix, so all of
+        // them ship enabled. These are Juhn's patches from the community database; the name
+        // casing differs between entries ("Freeze Fix" vs "Freeze fix") and patchSetEnabled
+        // matches it exactly, so it is reproduced verbatim rather than tidied.
+        //
+        // A Crack in Time replaces our own "FIFO drain wait fix", which wrote the same word
+        // with a different condition register and could only race it. See canary_patches.yml.
+        // Killzone 3 -- RPCS3's own patch, on by default because without it the HUD flickers
+        // constantly on ARM64 and a burst of coloured noise crosses the screen now and then. The
+        // patch stops the game running MLAA on the SPUs, which is where that comes from: turning
+        // it on removed the flicker outright, and every other lever we tried (the SPU block size,
+        // transfer accuracy, our SHUFB paths) left it exactly as it was.
+        //
+        // Four entries because the database keys these per executable AND per serial, and the two
+        // discs spell the name differently: no space before the bracket on 01.00, one on 01.14.
+        // patchSetEnabled matches the name exactly, so both spellings are reproduced verbatim.
+        //
+        // It also costs nothing to have on: RPCS3's notes say it improves performance and lets
+        // resolution scaling work, at the price of some screen effects.
+        Bundled(
+            hash = "PPU-ae204e2198c9a051a44a69913c48f6591b811082",
+            name = "Disable MLAA(Post-processing On SPU)",
+            serial = "BCES01007",
+            appVersion = "01.00",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-ae204e2198c9a051a44a69913c48f6591b811082",
+            name = "Disable MLAA(Post-processing On SPU)",
+            serial = "BCUS98234",
+            appVersion = "01.00",
+            sinceRevision = 8,
+        ),
+        Bundled(
+            hash = "PPU-4836b8e74c47919f50b030ee6b47d96bc7305387",
+            name = "Disable MLAA (Post-processing on SPU)",
+            serial = "BCES01007",
+            appVersion = "01.14",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-4836b8e74c47919f50b030ee6b47d96bc7305387",
+            name = "Disable MLAA (Post-processing on SPU)",
+            serial = "BCUS98234",
+            appVersion = "01.14",
+            sinceRevision = 8,
+        ),
+        Bundled(
+            hash = "PPU-c4e26433d1eed9166eb0c67b6f66b2268f3704e2",
+            name = "Freeze Fix",
+            serial = "BCES00052",
+            appVersion = "All",
+            sinceRevision = 4,
+        ),
+        Bundled(
+            hash = "PPU-ec77eaf73a4f55d1c4ece532c3be6db0011e49ca",
+            name = "Freeze Fix",
+            serial = "NPEA00452",
+            appVersion = "All",
+            sinceRevision = 4,
+        ),
+        Bundled(
+            hash = "PPU-f67f3e99077ba256728ffa16800c75e006661158",
+            name = "Freeze Fix",
+            serial = "BCUS98127",
+            appVersion = "01.00",
+            sinceRevision = 4,
+        ),
+        Bundled(
+            hash = "PPU-c14042df6304d3e420a9917e6f8e5fc05cc38b4c",
+            name = "Freeze Fix",
+            serial = "BCUS98127",
+            appVersion = "01.00",
+            sinceRevision = 4,
+        ),
+        Bundled(
+            hash = "PPU-16506d9d5bf692d615645accd24bca1ee1f8f9a6",
+            name = "Freeze Fix",
+            serial = "NPUA80965",
+            appVersion = "All",
+            sinceRevision = 4,
+        ),
+        Bundled(
+            hash = "PPU-4c819c69904784a56685c31df12f5d492bc0ed64",
+            name = "Freeze Fix",
+            serial = "BCAS20200",
+            appVersion = "01.03",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-4c819c69904784a56685c31df12f5d492bc0ed64",
+            name = "Freeze Fix",
+            serial = "BCES01141",
+            appVersion = "01.03",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-4c819c69904784a56685c31df12f5d492bc0ed64",
+            name = "Freeze Fix",
+            serial = "BCES01142",
+            appVersion = "01.03",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-4c819c69904784a56685c31df12f5d492bc0ed64",
+            name = "Freeze Fix",
+            serial = "BCUS98175",
+            appVersion = "01.03",
+            sinceRevision = 4,
+        ),
+        Bundled(
+            hash = "PPU-ed460e668a491f5e39f6547f3a24c2f20e2cb39b",
+            name = "Freeze fix",
+            serial = "BCES01908",
+            appVersion = "01.00",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-ed460e668a491f5e39f6547f3a24c2f20e2cb39b",
+            name = "Freeze fix",
+            serial = "BCES01949",
+            appVersion = "01.00",
+            sinceRevision = 4,
+        ),
+        // Into the Nexus v01.01, renamed in 15 so the Artemis collection's "Freeze fix" for this
+        // executable (same change, NPUA80908 only, higher version) cannot replace it. The new
+        // name has never been offered, so all five come in at 15. See canary_patches.yml.
+        Bundled(
+            hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
+            name = "Freeze fix (all regions)",
+            serial = "BCUS99245",
+            appVersion = "01.01",
+            sinceRevision = 15,
+        ),
+        Bundled(
+            hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
+            name = "Freeze fix (all regions)",
+            serial = "NPUA80908",
+            appVersion = "01.01",
+            sinceRevision = 15,
+        ),
+        Bundled(
+            hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
+            name = "Freeze fix (all regions)",
+            serial = "BCES01908",
+            appVersion = "01.01",
+            sinceRevision = 15,
+        ),
+        Bundled(
+            hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
+            name = "Freeze fix (all regions)",
+            serial = "BCES01949",
+            appVersion = "01.01",
+            sinceRevision = 15,
+        ),
+        Bundled(
+            hash = "PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08",
+            name = "Freeze fix (all regions)",
+            serial = "NPEA00457",
+            appVersion = "01.01",
+            sinceRevision = 15,
+        ),
+        Bundled(
+            hash = "PPU-f07f7086588a4ea86a28bd768f0cbe710f5b813b",
+            name = "Freeze Fix",
+            serial = "BCAS20052",
+            appVersion = "All",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-f07f7086588a4ea86a28bd768f0cbe710f5b813b",
+            name = "Freeze Fix",
+            serial = "BCES00301",
+            appVersion = "All",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-f07f7086588a4ea86a28bd768f0cbe710f5b813b",
+            name = "Freeze Fix",
+            serial = "NPEA00088",
+            appVersion = "All",
+            sinceRevision = 14,
+        ),
+        Bundled(
+            hash = "PPU-f07f7086588a4ea86a28bd768f0cbe710f5b813b",
+            name = "Freeze Fix",
+            serial = "NPEA00106",
+            appVersion = "All",
+            sinceRevision = 4,
+        ),
+        Bundled(
+            hash = "PPU-1d9e99e1f091cfbdf1714d04e690d9cd816e2971",
+            name = "Freeze Fix",
+            serial = "NPUA80145",
+            appVersion = "All",
+            sinceRevision = 4,
+        ),
+        Bundled(
+            hash = "PPU-0997e35d2b6738f5cecfda1d76380acca0828365",
+            name = "Freeze Fix",
+            serial = "BCUS98124",
+            appVersion = "01.00",
+            sinceRevision = 4,
+        ),
+        // TALES OF GRACES F, BLUS30903 -- ours. Keeps the field at 30 fps under the 60 fps limit that
+        // ConfigDatabase.LOCAL_OVERRIDES gives this title, so battles run at 60 (issue #210).
+        // See canary_patches.yml.
+        Bundled(
+            hash = "PPU-3e9032a3f7857057ef783810bd8f34a439baaa59",
+            name = "Field at 30 fps with a 60 fps limit",
+            serial = "BLUS30903",
+            appVersion = "All",
+            sinceRevision = 20,
+        ),
+        // J-STARS VICTORY VS+, BLUS31519 -- ours. An effect job halts its SPU on a record the game
+        // has already reused, freezing the battle with the music still playing (RPCS3 #7858).
+        // See canary_patches.yml.
+        Bundled(
+            hash = "PPU-db1e09abb1a2785532b89e9a366d2510ba8e070c",
+            name = "Battle freeze fix",
+            serial = "BLUS31519",
+            appVersion = "01.00",
+            sinceRevision = 21,
+        ),
+        // SKYLANDERS: SPYRO'S ADVENTURE, BLUS30779 -- ours. The job worker, created below the two threads
+        // that spin on its locks with yield, never ran again once preempted holding one: a freeze a
+        // minute or two in. It now runs at their priority. See canary_patches.yml.
+        Bundled(
+            hash = "PPU-6e828d3466bb1272243213bef0df0e499f3965a5",
+            name = "Freeze fix",
+            serial = "BLUS30779",
+            appVersion = "01.00",
+            sinceRevision = 22,
+        ),
+        // JOURNEY, all eight serials -- Whatcookie's "Disable SPU MLAA" from RPCS3's database, copied
+        // for Journey alone (the original switches MLAA off in every game running the program).
+        // With MLAA on the game froze entering the Graveyard. See canary_patches.yml.
+        Bundled(
+            hash = "SPU-9001b44fd7278b5a6fa5385939fe928a0e549394",
+            name = "Disable SPU MLAA (Journey)",
+            serial = "NPUA80275",
+            appVersion = "All",
+            sinceRevision = 24,
+        ),
+        Bundled(
+            hash = "SPU-9001b44fd7278b5a6fa5385939fe928a0e549394",
+            name = "Disable SPU MLAA (Journey)",
+            serial = "NPEA00288",
+            appVersion = "All",
+            sinceRevision = 24,
+        ),
+        Bundled(
+            hash = "SPU-9001b44fd7278b5a6fa5385939fe928a0e549394",
+            name = "Disable SPU MLAA (Journey)",
+            serial = "NPHA80188",
+            appVersion = "All",
+            sinceRevision = 24,
+        ),
+        Bundled(
+            hash = "SPU-9001b44fd7278b5a6fa5385939fe928a0e549394",
+            name = "Disable SPU MLAA (Journey)",
+            serial = "NPUA70218",
+            appVersion = "All",
+            sinceRevision = 24,
+        ),
+        Bundled(
+            hash = "SPU-9001b44fd7278b5a6fa5385939fe928a0e549394",
+            name = "Disable SPU MLAA (Journey)",
+            serial = "NPEA00438",
+            appVersion = "All",
+            sinceRevision = 24,
+        ),
+        Bundled(
+            hash = "SPU-9001b44fd7278b5a6fa5385939fe928a0e549394",
+            name = "Disable SPU MLAA (Journey)",
+            serial = "BCUS98377",
+            appVersion = "All",
+            sinceRevision = 24,
+        ),
+        Bundled(
+            hash = "SPU-9001b44fd7278b5a6fa5385939fe928a0e549394",
+            name = "Disable SPU MLAA (Journey)",
+            serial = "BCES01740",
+            appVersion = "All",
+            sinceRevision = 24,
+        ),
+        Bundled(
+            hash = "SPU-9001b44fd7278b5a6fa5385939fe928a0e549394",
+            name = "Disable SPU MLAA (Journey)",
+            serial = "NPUA70230",
+            appVersion = "All",
+            sinceRevision = 24,
+        ),
+        // NAUGHTY BEAR: PANIC IN PARADISE -- ours. Its graphics raw SPU, the game's frame rate limit in
+        // play, spent about a quarter of its time in two copies written one byte per pass; the patch
+        // copies 16 bytes a pass. See canary_patches.yml. Revision 27: test builds used 25 and 26.
+        Bundled(
+            hash = "SPU-7d3b6a847736ef3198deee3620f00c648e5e9588",
+            name = "ARMSX3 graphics SPU speed-up",
+            serial = "NPUB30828",
+            appVersion = "All",
+            sinceRevision = 27,
+        ),
+        Bundled(
+            hash = "SPU-7d3b6a847736ef3198deee3620f00c648e5e9588",
+            name = "ARMSX3 graphics SPU speed-up",
+            serial = "NPEB01054",
+            appVersion = "All",
+            sinceRevision = 27,
+        ),
+    )
+
+    private const val BUNDLED_ASSET = "canary_patches.yml"
+
+    /**
+     * Bumped whenever canary_patches.yml gains or changes a patch, so an existing
+     * install re-imports and enables the new ones. Not a timestamp: it has to be
+     * something a diff of this file makes obvious.
+     */
+    private const val BUNDLED_REVISION = 28
+
+    private const val PREFS_NAME = "ARMSX2"
+    private const val KEY_BUNDLED_REVISION = "ps3_bundled_patch_revision"
+
+    /** Bundled entries that could not be turned on when their revision came round; see below. */
+    private const val KEY_BUNDLED_RETRY = "ps3_bundled_patch_retry"
+
+    /**
+     * Import the bundled canary patches and switch them on, once per revision.
+     *
+     * These fix games that are otherwise unplayable, so they default to ON rather
+     * than merely being present in the Patch Manager -- a user who has to find and
+     * tick a box before Sonic '06 renders has already concluded the emulator is
+     * broken.
+     *
+     * Only patches newer than the stored revision are touched, so turning one OFF
+     * sticks -- including across a later bump made for some other game. Re-enabling
+     * on every launch, or on every bump, would make the toggle look broken, which is
+     * the same class of bug as not having the patch at all.
+     *
+     * Safe to call on every boot: once the revision matches and the file is there, it is a
+     * preference read and one stat. A patch that could not be turned on (one from RPCS3's
+     * database, before that has been downloaded) is retried on its own at each boot until it is.
+     *
+     * The patches live in patches/armsx3_patch.yml, a file of the app's own that the core
+     * applies beside the downloaded ones and that no download replaces. Until 1.0 they were
+     * merged into patch.yml, which a database download now replaces whole, and a patch that is
+     * switched on but in no file is silently not applied: Burnout, Soulcalibur V, Sonic '06 and
+     * the Ratchet games would each have lost their fix with no sign of why. The file is checked
+     * on every call, not only on a revision bump, because it can go missing on its own (a new
+     * data folder, a cleared patches directory) while the stored revision says all is done.
+     */
+    fun ensureBundledPatches(context: Context) {
+        val prefs = prefs(context)
+        val storedRevision = prefs.getInt(KEY_BUNDLED_REVISION, 0)
+        val retry = prefs.getStringSet(KEY_BUNDLED_RETRY, null).orEmpty()
+        val fileMissing = !java.io.File(patchesDir(), BUNDLED_FILE).isFile
+        val needWrite = storedRevision < BUNDLED_REVISION || fileMissing
+        if (!needWrite && retry.isEmpty()) return
+
+        var imported = 0
+        if (needWrite) {
+            val yaml = runCatching {
+                context.assets.open(BUNDLED_ASSET).bufferedReader().use { it.readText() }
+            }.getOrNull()
+
+            if (yaml.isNullOrBlank()) {
+                android.util.Log.e("ARMSX3", "canary patches: $BUNDLED_ASSET missing from assets")
+                return
+            }
+
+            imported = runCatching { ARMSX3.instance.patchesWrite(BUNDLED_FILE, yaml) }.getOrDefault(-1)
+            if (imported < 0) {
+                android.util.Log.e("ARMSX3", "canary patches: could not write $BUNDLED_FILE")
+                return
+            }
+        }
+
+        // Anything at or below the stored revision has had its one chance to be turned
+        // on. Re-enabling it here would silently undo a user's OFF, and patch_config.yml
+        // stores "disabled" as an absent entry, so there is nothing to read back that
+        // would tell us the difference between "opted out" and "never seen". So a file that
+        // was only restored enables nothing. The exception is a patch that could not be turned
+        // on when its chance came; it is in `retry` until it does.
+        val pending = BUNDLED.filter { it.sinceRevision > storedRevision || it.key in retry }
+
+        // Every pending patch gets its turn, and the revision is recorded whatever happens.
+        //
+        // This used to stop at the first patch that would not turn on and record nothing, so
+        // the revision ran again on every boot. Killzone 3's "Disable MLAA" comes from RPCS3's
+        // database, not canary_patches.yml, so it cannot turn on until that database has been
+        // downloaded. On an install without it, every patch listed after it was never switched
+        // on (the Ratchet & Clank freeze fixes, Tales of Graces f, J-Stars Victory VS+,
+        // Skylanders: Spyro's Adventure), and the ones before it were switched back on at every
+        // launch, undoing anyone's OFF. Now a failure is remembered on its own and retried on
+        // later boots, where it turns on once the database is there, without touching the rest.
+        val failed = pending.filterNot { b ->
+            val ok = runCatching {
+                ARMSX3.instance.patchSetEnabled(b.hash, b.name, b.serial, b.appVersion, true)
+            }.getOrDefault(false)
+            if (!ok) {
+                android.util.Log.w("ARMSX3", "canary patches: could not enable ${b.name} (${b.hash}), will retry")
+            }
+            ok
+        }
+
+        prefs.edit()
+            .putInt(KEY_BUNDLED_REVISION, BUNDLED_REVISION)
+            .putStringSet(KEY_BUNDLED_RETRY, failed.map { it.key }.toSet())
+            .apply()
+        android.util.Log.i(
+            "ARMSX3",
+            "canary patches: imported $imported, enabled ${pending.size - failed.size}, retrying ${failed.size}",
+        )
+    }
+}
