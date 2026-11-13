@@ -23,14 +23,19 @@ struct Ps3pCrossBar: View {
     private var compact: Bool { vSize == .compact }
 
     var body: some View {
+        // Floats at the bottom, centred; the clock joins it only in landscape,
+        // where the system status bar is hidden and there is room for both.
         HStack(spacing: 14) {
+            Spacer(minLength: 0)
             strip
-            Spacer(minLength: 8)
-            Ps3pStatusCluster()
+            if compact {
+                Ps3pStatusCluster()
+            }
+            Spacer(minLength: 0)
         }
-        .padding(.horizontal, compact ? 28 : 18)
-        .padding(.top, compact ? 6 : 4)
-        .padding(.bottom, 6)
+        .padding(.horizontal, 18)
+        .padding(.top, 6)
+        .padding(.bottom, compact ? 4 : 2)
         .onChange(of: selection) { old, new in
             guard old != new else { return }
             Ps3pAudio.shared.play(.cursor)
@@ -110,6 +115,8 @@ struct Ps3pStatusCluster: View {
                     .foregroundStyle(.white.opacity(0.65))
             }
             .foregroundStyle(.white)
+            .lineLimit(1)
+            .fixedSize()
             .padding(.horizontal, 14)
             .frame(height: 34)
             .background(Capsule().fill(.ultraThinMaterial).environment(\.colorScheme, .dark))

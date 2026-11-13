@@ -15,7 +15,7 @@ import SwiftUI
     // MARK: - The background
 
     var dynamicBackgroundsEnabled: Bool {
-        didSet { defaults.set(dynamicBackgroundsEnabled, forKey: Self.key("dynamicBackgroundsEnabled")) }
+        didSet { defaults.set(dynamicBackgroundsEnabled, forKey: Self.key("dynamicBackgroundsEnabledPs3p")) }
     }
 
     /// Stored as JSON.
@@ -259,7 +259,8 @@ import SwiftUI
         func bool(_ member: String, _ fallback: Bool) -> Bool { defaults.object(forKey: Self.key(member)) as? Bool ?? fallback }
         func double(_ member: String, _ fallback: Double) -> Double { defaults.object(forKey: Self.key(member)) as? Double ?? fallback }
 
-        dynamicBackgroundsEnabled = bool("dynamicBackgroundsEnabled", true)
+        // Ps3p: off by default (new key, so existing installs switch too) so the Flow background shows.
+        dynamicBackgroundsEnabled = bool("dynamicBackgroundsEnabledPs3p", false)
         dynamicAppearancePreferences = defaults.data(forKey: Self.key("dynamicAppearancePreferences"))
             .flatMap { try? JSONDecoder().decode(DynamicAppearancePreferences.self, from: $0) } ?? .standard
         backgroundDim = min(max(double("backgroundDim", 0), 0), 1)

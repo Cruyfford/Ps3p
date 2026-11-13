@@ -1906,7 +1906,7 @@ struct MenuTabView: View {
                 )
                 .environment(\.menuTabBarContentMargin, settingsTabBarContentMargin)
                 // Ps3p: the floating category bar replaces the bottom tab bar.
-                .safeAreaInset(edge: .top, spacing: 0) {
+                .safeAreaInset(edge: .bottom, spacing: 0) {
                     Ps3pCrossBar(
                         selection: tabSelection,
                         categories: (0..<menuTabCount).map {
