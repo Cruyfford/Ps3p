@@ -29,6 +29,8 @@ struct DuoHingeReader: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
         view.isUserInteractionEnabled = false
+        // Ps3p: the hinge API needs the iOS 27 SDK; the hosted runners build with Xcode 26.
+        #if PS3P_IOS27_SDK
         if #available(iOS 27.1, *) {
             view.addInteraction(UIHingeInteraction { _, update in
                 // An update with no hinge comes from a reader leaving its window and says nothing about the hinge.
@@ -36,6 +38,7 @@ struct DuoHingeReader: UIViewRepresentable {
                 DuoHinge.shared.set(present: status != .unknown, partiallyOpen: status == .partiallyOpen)
             })
         }
+        #endif
         return view
     }
 
@@ -45,9 +48,13 @@ struct DuoHingeReader: UIViewRepresentable {
 extension GeometryProxy {
     /// The fold while the hinge is half open, in this proxy's space; nil when flat, closed, or before iOS 27.1.
     @MainActor func halfOpenFold() -> CGRect? {
+        #if PS3P_IOS27_SDK
         guard DuoHinge.shared.partiallyOpen, #available(iOS 27.1, *) else { return nil }
         let bounds = CGRect(origin: .zero, size: size)
         return reservedRegions(kind: .division).first { $0.isActive && $0.frame.intersects(bounds) }?.frame
+        #else
+        return nil
+        #endif
     }
 
     @MainActor func tabletopFold() -> CGRect? {

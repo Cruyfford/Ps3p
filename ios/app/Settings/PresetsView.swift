@@ -133,7 +133,8 @@ struct PresetsView: View {
     private var target: String { settings.scope == .game ? settings.gameTitle : String(localized: "All Games") }
     private var changed: Int { settings.dump.map { SettingsModel.changedCount($0.leaves, scope: settings.scope) } ?? 0 }
 
-    var body: some View {
+    // Split from body so the type checker finishes in time on Xcode 26.
+    private var page: some View {
         SettingsPage {
             VStack(spacing: 8) {
                 Button("Save as Preset") { startSave() }
@@ -178,6 +179,10 @@ struct PresetsView: View {
                                            onBack: { pop() }, onContextMenu: { id in openDialog(navigationID: id) },
                                            onPreviousTab: controller.onPreviousTab, onNextTab: controller.onNextTab,
                                            onBoundary: controller.onBoundary)
+    }
+
+    private var pageWithDialogs: some View {
+        page
         .alert("Name this preset", isPresented: $naming) {
             TextField("Preset name", text: $name)
             Button("Save Preset") { Task { await presets.save(name: name, serial: serial, count: changed) } }
@@ -210,6 +215,10 @@ struct PresetsView: View {
         .alert(presets.notice ?? "", isPresented: Binding(get: { presets.notice != nil }, set: { if !$0 { presets.notice = nil } })) {
             Button("OK", role: .cancel) {}
         }
+    }
+
+    var body: some View {
+        pageWithDialogs
         .sheet(isPresented: $picking) {
             SavePicker(types: [UTType(filenameExtension: "yml") ?? .data, UTType(filenameExtension: "yaml") ?? .data]) { url in
                 picking = false
