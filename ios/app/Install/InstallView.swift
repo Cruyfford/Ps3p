@@ -117,12 +117,11 @@ struct InstallView: View {
                 UpdateStore.shared.openOnUpdates = false
             }
         }
-        .sheet(isPresented: $picking) {
-            InstallPicker { urls in
-                picking = false
-                guard !urls.isEmpty else { return }
-                Task { if await model.install(urls: urls) { await model.refreshAfterContentChange(onInstalled) } }
-            }
+        // Ps3p: the system file importer, opened in place (no copy). The UIKit picker hosted in
+        // a sheet could leave "Open" doing nothing on some iOS versions.
+        .fileImporter(isPresented: $picking, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            guard case .success(let urls) = result, !urls.isEmpty else { return }
+            Task { if await model.install(urls: urls) { await model.refreshAfterContentChange(onInstalled) } }
         }
         .sheet(item: $uninstalling) { title in
             UninstallSheet(serial: title.serial, gameTitle: title.title, onUninstalled: {
