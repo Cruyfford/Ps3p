@@ -25,6 +25,7 @@ struct GameListView: View {
     @State private var contextSelection: GameLibraryControllerMenuAction?
     @State private var lockedEntry: LibraryCache.Entry?
     @State private var licenceEntry: LibraryCache.Entry?
+    @State private var licenceLookupSerial: String?
     @State private var licenceNotice: String?
     @State private var clearingCacheEntry: LibraryCache.Entry?
     @State private var coverEntry: LibraryCache.Entry?
@@ -67,7 +68,7 @@ struct GameListView: View {
                     Button("Add licence…") { addLicence(for: entry) }
                     Button("Cancel", role: .cancel) {}
                 } message: { _ in
-                    Text("Pick the game's .rap licence file. It is matched to this game whatever the file is called.")
+                    Text("Ps3p checked RAP1 and RAP for a .rap named with this game's full Content ID, but no valid matching licence could be installed. You can choose a file manually.")
                 }
                 .alert("Clear this game's cache?", isPresented: clearingCacheShown, presenting: clearingCacheEntry) { entry in
                     Button("Clear", role: .destructive) { Task { await clearCache(for: entry) } }
@@ -494,7 +495,11 @@ struct GameListView: View {
         selected = entry.bootPath
         switch Self.launchBlock(entry) {
         case .locked?:
-            lockedEntry = entry
+            // The Files app exposes our Documents/RAP1 folder. Search only by the
+            // exact NPD Content ID, never by the shorter game serial.
+            guard licenceLookupSerial == nil else { return false }
+            licenceLookupSerial = entry.serial
+            Task { await tryAutomaticLicence(for: entry) }
             return false
         case .explained(let why)?:
             licenceNotice = why
@@ -629,6 +634,34 @@ struct GameListView: View {
         case -9: return String(localized: "Stop the game first")
         default: return String(localized: "The cache wasn't cleared (status \(status))")
         }
+    }
+
+    /// Automatically install the user's own RAP from Files > On My iPhone > Ps3p > RAP1.
+    /// The emulator validates that the key actually unlocks this specific game.
+    private func tryAutomaticLicence(for entry: LibraryCache.Entry) async {
+        defer { licenceLookupSerial = nil }
+        let (lock, contentID, status) = await Rpcs3Bridge.probeLicence(forSerial: entry.serial)
+        guard status == 0, lock == 1, !contentID.isEmpty,
+              let rap = await Ps3pAutomaticRap.find(contentID: contentID) else {
+            lockedEntry = entry
+            return
+        }
+
+        let installed = await Rpcs3Bridge.installLicence(atPath: rap.path, forSerial: entry.serial)
+        guard installed == 0 else {
+            lockedEntry = entry
+            return
+        }
+
+        await model.reprobe(serial: entry.serial)
+        // Never treat the file name alone as proof of a usable licence.
+        guard let current = model.entries.first(where: { $0.bootPath == entry.bootPath }),
+              current.locked == false else {
+            lockedEntry = entry
+            return
+        }
+        licenceLookupSerial = nil
+        _ = open(current)
     }
 
     private func addLicence(for entry: LibraryCache.Entry) {
@@ -886,5 +919,40 @@ private struct TouchLayoutChoice: ViewModifier {
         return [.init(title: String(localized: "Same as All Games"), run: { pin(nil) })]
             + choices.map { choice in .init(title: library.name(of: choice), run: { pin(choice) }) }
             + [.init(title: String(localized: "Cancel"), isCancel: true)]
+    }
+}
+
+// RAP1 contains the user's original PS3 RAPs with their full Content IDs.
+// Do not infer a licence from a title ID (e.g. BLUS30463) or an attractive name.
+enum Ps3pAutomaticRap {
+    static func find(contentID: String) async -> URL? {
+        await Task.detached(priority: .userInitiated) { () -> URL? in
+            let id = contentID.uppercased()
+            guard id.range(
+                of: #"^[A-Z0-9]{6}-[A-Z0-9]{9}_00-[A-Z0-9_]{16}$"#,
+                options: .regularExpression
+            ) != nil else { return nil }
+
+            let files = FileManager.default
+            for name in ["RAP1", "RAP"] {
+                let folder = Ps3pInstallInbox.documents.appendingPathComponent(name, isDirectory: true)
+                let direct = folder.appendingPathComponent(id + ".rap")
+                if isRapFile(direct) { return direct }
+                // Case-insensitive fallback for filenames copied from other systems.
+                guard let items = try? files.contentsOfDirectory(
+                    at: folder, includingPropertiesForKeys: [.fileSizeKey],
+                    options: [.skipsHiddenFiles]
+                ) else { continue }
+                for item in items where item.pathExtension.lowercased() == "rap" {
+                    guard item.deletingPathExtension().lastPathComponent.uppercased() == id else { continue }
+                    if isRapFile(item) { return item }
+                }
+            }
+            return nil
+        }.value
+    }
+
+    private static func isRapFile(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize == 16
     }
 }
