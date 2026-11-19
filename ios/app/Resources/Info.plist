@@ -110,6 +110,20 @@
 	</array>
 	<key>CFBundleDocumentTypes</key>
 	<array>
+		<!-- Ps3p: offered (never the default) for PS3 packages, licences and firmware. -->
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>PS3 Package</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.apple.installer-package-archive</string>
+				<string>public.data</string>
+			</array>
+		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
 			<string>ARMSX3 Touch Layout</string>

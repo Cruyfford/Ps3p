@@ -4,6 +4,9 @@ import SwiftUI
 
 @main
 struct ARMSX3App: App {
+    // Ps3p: the Install folder exists from first launch so it shows in the Files app.
+    init() { Ps3pInstallInbox.prepare() }
+
     var body: some Scene {
         WindowGroup {
             ARMSX3FrontendRoot()

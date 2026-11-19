@@ -71,6 +71,11 @@ struct InstallView: View {
                             .foregroundStyle(OverlayTheme.textSecondary)
                             .multilineTextAlignment(.center)
                             .padding(.horizontal)
+                        Ps3pInboxCard(busy: model.busy) { urls in
+                            let ok = await model.install(urls: urls)
+                            if ok { await model.refreshAfterContentChange(onInstalled) }
+                            return ok
+                        }
                         ForEach(model.rows) { row in
                             rowView(row)
                         }
