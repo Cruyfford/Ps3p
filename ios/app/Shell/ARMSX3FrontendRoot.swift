@@ -110,7 +110,7 @@ struct ARMSX3FrontendRoot: View {
         }
         // Ps3p: PKG/RAP/EDAT/PUP opened in Ps3p from Files or the share sheet.
         if Ps3pInstallInbox.receive(url) {
-            linkMessage = String(localized: "\(url.lastPathComponent) is ready on the Install tab. Tap Install there.")
+            linkMessage = String(localized: "\(url.lastPathComponent) is in the Ps3p folders. Open the Install tab and tap Install all.")
             return
         }
         if url.isFileURL, url.pathExtension.lowercased() == PadLayoutFile.fileExtension {
