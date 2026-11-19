@@ -10,6 +10,9 @@
 #include "Emu/RSX/rsx_profiler.h"
 #include "vkutils/buffer_object.h"
 #include "vkutils/chip_class.h"
+#if defined(__APPLE__) && defined(ARCH_ARM64)
+#include "ios_jit_dual_map.h"
+#endif
 #include <vulkan/vulkan_core.h>
 
 #include "Emu/RSX/NV47/HW/context_accessors.define.h"
@@ -888,7 +891,16 @@ bool VKGSRender::bind_texture_env()
 
 bool VKGSRender::bind_interpreter_texture_env()
 {
-	if (m_ctx->program.fp_metadata.referenced_textures_mask == 0)
+	// ARMSX3: a draw that samples nothing can still get an interpreter with the texture arrays: the base
+	// variant preload() registers under the key of the draw's own variant, which get() returns until
+	// that variant is built. Its arrays then get the null textures below, like any slot no texture is
+	// bound to. Left alone they would keep the views of an earlier draw, which may be destroyed by then,
+	// or, until a draw that samples has gone through that pipeline, no descriptor at all: a null sampler,
+	// which Turnip dereferences when it writes the descriptor set, and a write template of one descriptor
+	// per array, which the next draw that samples fails in update_descriptor_template().
+	// Contributed by k1r4ct (issue #281).
+	if (m_ctx->program.fp_metadata.referenced_textures_mask == 0 &&
+		!m_shader_interpreter.has_fragment_textures())
 	{
 		// Nothing to do
 		return false;
@@ -1431,6 +1443,17 @@ bool VKGSRender::resolve_sampler_state(rsx::flags32_t& invalidated_programs)
 
 		m_current_frame->flags &= ~frame_context_state::dirty;
 	}
+
+#if defined(__APPLE__) && defined(ARCH_ARM64)
+	// At its 128 MiB ceiling a full upload ring can only swap mid-upload, and holding two gets 4 GB iPhones killed
+	static u64 s_upload_ring_reclaim_frame = umax;
+	if (utils::low_memory_device() && m_texture_upload_buffer_ring_info.size() >= 128 * 0x100000 &&
+		m_texture_upload_buffer_ring_info.needs_room(32 * 0x100000) && s_upload_ring_reclaim_frame != vk::get_current_frame_id())
+	{
+		s_upload_ring_reclaim_frame = vk::get_current_frame_id();
+		flush_command_queue(true);
+	}
+#endif
 
 	invalidated_programs = load_texture_env();
 	return true;

@@ -579,8 +579,8 @@ namespace armsx3::bridge::title_config
 		{"NPUB31590", "Core:\n  PPU Decoder: Recompiler (LLVM)\n"},
 
 		// Tied to the bundled "Disable MLAA" patch; SPU threads at Auto avoid a prologue freeze that a cap exposes.
-		{"BCUS98234", "Video:\n  Write Color Buffers: false\nCore:\n  Preferred SPU Threads: 0\n"},
-		{"BCES01007", "Video:\n  Write Color Buffers: false\nCore:\n  Preferred SPU Threads: 0\n"},
+		{"BCUS98234", "Video:\n  Write Color Buffers: false\n  Vulkan:\n    Fence Poll Completion Markers: true\nCore:\n  Preferred SPU Threads: 0\n"},
+		{"BCES01007", "Video:\n  Write Color Buffers: false\n  Vulkan:\n    Fence Poll Completion Markers: true\nCore:\n  Preferred SPU Threads: 0\n"},
 
 		// On, the SPURS control-block atomics take vm::writer_lock about 550,000 times a second; off-spec, so this title only.
 		{"BLUS30218", "Core:\n  Accurate SPU Reservations: false\n"},
@@ -644,11 +644,11 @@ namespace armsx3::bridge::title_config
 		{"NPUA70080", "Core:\n  SPU XFloat Accuracy: Relaxed\n"},
 
 		// The iOS product file pins the scheduler to the OS, so only GETLLAR 0 applies here; it lets a polling SPU wait in the OS.
-		{"BCES00052", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n"},
-		{"BCUS98127", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n"},
-		{"BCJS30014", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n"},
-		{"NPEA00452", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n"},
-		{"NPUA80965", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n"},
+		{"BCES00052", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n"},
+		{"BCUS98127", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n"},
+		{"BCJS30014", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n"},
+		{"NPEA00452", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n"},
+		{"NPUA80965", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\nVideo:\n  Vulkan:\n    Vertex Fetch Specialization: true\n    Early Submit Draw Threshold: 1024\n    Fence Poll Completion Markers: true\n"},
 		{"BCES00301", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n"},
 		{"BCAS20052", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n"},
 		{"NPEA00088", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n"},
@@ -660,12 +660,35 @@ namespace armsx3::bridge::title_config
 		{"BCUS99245", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n"},
 		{"NPEA00457", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n"},
 		{"NPUA80908", "Core:\n  Thread Scheduler Mode: RPCS3 Scheduler\n  SPU GETLLAR Busy Waiting Percentage: 0\n"},
+
+		// The Last of Us: background SPU compiling needs the pause off, and a boot that built the saved SPU list first stalled on a loading screen.
+		{"BCUS98174", "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n"},
+		{"BCES01584", "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n"},
+		{"BCES01585", "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n"},
+		{"BCJS37010", "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n"},
+		{"BCAS20270", "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n"},
+		{"NPUA80960", "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n"},
+		{"NPEA00435", "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n"},
+		{"NPHA80243", "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n"},
+		{"NPJA00096", "Core:\n  Pause Game During SPU Compilation: false\n  Stub PPU Traps: 1\n  SPU Cache: false\n"},
+
+		// Blur: its splash video went black with background SPU compiling on and played with the pause on, so it keeps the pause off.
+		{"BLUS30295", "Core:\n  Pause Game During SPU Compilation: false\n"},
 	};
 
-	// iOS-only rows, kept apart so the table above stays Android's entry for entry; tests check the two do not overlap.
+	// iOS-only rows, kept apart so the table above stays Android's entry for entry. A row here wins over the same serial above, and tests allow that overlap only for the serials they name.
 	inline constexpr local_override ios_only_overrides[] = {
 		// Its SPU loop polls the decrementer, and loop detection lets it yield; per title because the global setting hurts other games.
 		{"NPUB30558", "Core:\n  SPU loop detection: true\n"},
+
+		// Relaxed XFloat, which Android's table sets, turns Kratos' brows, beard and face white in the menu and cutscenes here.
+		{"BCUS98111", "Core:\n  SPU XFloat Accuracy: Approximate\n"},
+		{"BCES00510", "Core:\n  SPU XFloat Accuracy: Approximate\n"},
+		{"BCES00799", "Core:\n  SPU XFloat Accuracy: Approximate\n"},
+		{"BCAS25003", "Core:\n  SPU XFloat Accuracy: Approximate\n"},
+		{"BCKS15003", "Core:\n  SPU XFloat Accuracy: Approximate\n"},
+		{"BCJS37001", "Core:\n  SPU XFloat Accuracy: Approximate\n"},
+		{"NPUA70080", "Core:\n  SPU XFloat Accuracy: Approximate\n"},
 
 		// The shader interpreter draws this game's intro wrong until pipelines compile.
 		{"BLUS30837", "Video:\n  Shader Mode: Async Recompiler (multi-threaded)\n"},
@@ -675,6 +698,9 @@ namespace armsx3::bridge::title_config
 		{"BLUS30405", "Core:\n  Pause Game During SPU Compilation: true\n"},
 		{"BLES00713", "Core:\n  Pause Game During SPU Compilation: true\n  SPU Poll Park Sites: 3f47c:40801083\n"},
 		{"BLES00714", "Core:\n  Pause Game During SPU Compilation: true\n"},
+
+		// Cold starts sometimes freeze while SPU code compiles on demand; pausing the game during compiles stops it.
+		{"BCUS98174", "Core:\n  Pause Game During SPU Compilation: true\n"},
 
 		// Exact ZCULL stats make the torches flicker on iPhone; approximate stats stop it.
 		{"BLES00158", "Video:\n  Accurate ZCULL stats: false\n  Relaxed ZCULL Sync: false\n"},
@@ -702,19 +728,22 @@ namespace armsx3::bridge::title_config
 		{"NPUA80918", "Core:\n  Stub PPU Traps: 1\n"},
 		{"NPEA00445", "Core:\n  Stub PPU Traps: 1\n"},
 		{"NPHA80258", "Core:\n  Stub PPU Traps: 1\n"},
+
+		// Six busy SPU threads crowd out the PPU in Zombies; letting two run at once gave about a sixth more fps on a Mac.
+		{"BLES01717", "Core:\n  Preferred SPU Threads: 2\n"},
 	};
 
 	// Empty when neither table has the serial.
 	inline std::string_view local_override_for(std::string_view serial)
 	{
-		for (const local_override& o : local_overrides)
+		for (const local_override& o : ios_only_overrides)
 		{
 			if (o.serial == serial)
 			{
 				return o.config;
 			}
 		}
-		for (const local_override& o : ios_only_overrides)
+		for (const local_override& o : local_overrides)
 		{
 			if (o.serial == serial)
 			{

@@ -35,6 +35,26 @@
 #include "ios_jit_dual_map.h"
 #endif
 
+#if TARGET_OS_IPHONE
+namespace
+{
+	// glslang builds its built-in symbol tables on the first parse of a GLSL version, which costs tens of
+	// milliseconds on the RSX thread. The empty shader pays that at boot instead. It uses "#version 450" like the RSX
+	// programs, because glslang keeps one set of tables per version.
+	std::unique_ptr<named_thread<std::function<void()>>> s_glslang_prewarm;
+
+	void start_glslang_prewarm()
+	{
+		s_glslang_prewarm = std::make_unique<named_thread<std::function<void()>>>("RSX glslang prewarm"sv, []()
+		{
+			std::string source = "#version 450\nlayout(location=0) out vec4 ocol;\nvoid main()\n{\n\tocol = vec4(0.);\n}\n";
+			std::vector<u32> spv;
+			spirv::compile_glsl_to_spv(spv, source, ::glsl::glsl_fragment_program, ::glsl::glsl_rules_vulkan);
+		});
+	}
+}
+#endif
+
 namespace vk
 {
 	VkCompareOp get_compare_func(rsx::comparison_function op, bool reverse_direction = false);
@@ -656,6 +676,25 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept 
 	null_buffer = std::make_unique<vk::buffer>(*m_device, 32, memory_map.device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT, 0, VMM_ALLOCATION_POOL_UNDEFINED);
 	null_buffer_view = std::make_unique<vk::buffer_view>(*m_device, null_buffer->value, VK_FORMAT_R8_UINT, 0, 32);
 
+	// Fence poll completion markers, see arm_completion_marker. Read once per renderer, so each boot
+	// uses its own game's setting. Allocated here and not on first use, which is inside a submit,
+	// where an allocation must not ask for a flush.
+	if (g_cfg.video.vk.fence_poll_completion_markers)
+	{
+		// One word per primary command buffer, cleared once and kept mapped, so checking a command
+		// buffer costs a memory read. Host coherent: the GPU's write reaches that read without an
+		// invalidate.
+		const u64 size = VK_MAX_ASYNC_CB_COUNT * sizeof(u32);
+		m_cb_done_markers = std::make_unique<vk::buffer>(*m_device, size, memory_map.host_visible_coherent,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_SYSTEM);
+		m_cb_done_marker_map = static_cast<u32*>(m_cb_done_markers->map(0, size));
+		std::memset(m_cb_done_marker_map, 0, size);
+
+		// A previous renderer may have given up on them; this one starts trusting them again
+		vk::g_completion_marker_failed = false;
+		rsx_log.notice("VK: fence poll completion markers on");
+	}
+
 	// Initialize the shader compiler stack
 #ifdef ANDROID
 	// Not every thread on Android. The workers are pinned to thread_class::general, which is the
@@ -673,6 +712,9 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept 
 #endif
 
 	spirv::initialize_compiler_context();
+#if TARGET_OS_IPHONE
+	start_glslang_prewarm();
+#endif
 	vk::initialize_pipe_compiler(preferred_compiler_threads);
 
 	m_prog_buffer = std::make_unique<vk::program_cache>
@@ -1027,8 +1069,12 @@ VKGSRender::~VKGSRender()
 
 	// Shaders
 	vk::destroy_pipe_compiler();        // Ensure no pending shaders being compiled
+#if TARGET_OS_IPHONE
+	s_glslang_prewarm.reset();
+#endif
 	spirv::finalize_compiler_context(); // Shut down the glslang compiler
 	m_prog_buffer->clear();             // Delete shader objects
+	vk::glsl::destroy_shared_descriptor_pools(); // ARMSX3: the draw programs' pools, after them
 	vk::vspec::deactivate();            // The next boot decides again
 	m_shader_interpreter.destroy();
 
@@ -1076,6 +1122,14 @@ VKGSRender::~VKGSRender()
 	// Command buffer
 	m_primary_cb_list.destroy();
 	m_secondary_cb_list.destroy();
+
+	// Fence poll completion markers, if the setting was on
+	if (m_cb_done_markers)
+	{
+		m_cb_done_markers->unmap();
+		m_cb_done_markers.reset();
+		m_cb_done_marker_map = nullptr;
+	}
 
 	m_command_buffer_pool.destroy();
 	m_secondary_command_buffer_pool.destroy();
@@ -2597,7 +2651,14 @@ bool VKGSRender::load_program()
 	if (shadermode == shader_mode::async_with_interpreter || shadermode == shader_mode::interpreter_only)
 	{
 		const bool is_interpreter = !m_program;
-		const bool was_interpreter = m_shader_interpreter.is_interpreter(m_prev_program);
+
+		// ARMSX3: what the last draw that ran used, whose constants the buffers hold, laid out for it: all
+		// the transform constants for the interpreter, for a recompiled vertex program only those it reads
+		// unless it indexes them. m_prev_program only changes with the programs, so a hand-over between the
+		// interpreter and a recompiled pipeline of the same programs (that pipeline becoming ready, or
+		// another render state still compiling) could go unseen, and the draw read the other layout.
+		// Contributed by k1r4ct (issue #281).
+		const bool was_interpreter = m_last_program_interpreted;
 
 		// First load the next program if not available
 		if (!m_program)
@@ -2624,6 +2685,12 @@ bool VKGSRender::load_program()
 			{
 				m_stale_constants.set(rsx::draw_state_t::group::fragment_constants);
 			}
+		}
+
+		if (m_program)
+		{
+			// ARMSX3: this draw runs, see was_interpreter above
+			m_last_program_interpreted = is_interpreter;
 		}
 	}
 
@@ -2740,7 +2807,7 @@ void VKGSRender::load_program_env()
 			auto buf = m_fragment_constants_ring_info.map(m_fragment_constants_dynamic_offset, fragment_constants_size);
 
 			m_prog_buffer->fill_fragment_constants_buffer({ reinterpret_cast<float*>(buf), fragment_constants_size },
-				*ensure(m_fragment_prog), m_ctx->program.fragment_program, true);
+				*ensure(m_fragment_prog), m_ctx->program.fragment_program, false);
 
 			m_fragment_constants_ring_info.unmap();
 
@@ -3123,6 +3190,70 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
 	}
 }
 
+// Fence poll completion markers (Video/Vulkan "Fence Poll Completion Markers", off by default).
+//
+// Make the last command of [cmd] write a number of its own into a word of mapped memory, so that
+// poke() can tell from a memory read that the GPU has not got to the end of [cmd] yet, and answer
+// "not yet" without asking the driver about the fence.
+//
+// Every caller of poke() means "is it done, do not wait", and poke() asks with a zero-timeout
+// vkWaitForFences, which is specified to return VK_TIMEOUT at once. Turnip over KGSL before
+// kgsl_poll_timestamp() (measured: Mesa 26.3.0-devel a995eaeda4) hands the zero timeout to KGSL's
+// timestamp wait as 0 ms, which KGSL takes as no timeout: the call sleeps until the fence signals.
+// The poll that pays most is frame generation's, made from right after each flip on the buffers
+// that copy the generated frames into the swapchain (present_after_generated): it parked the RSX
+// thread until the GPU had finished the frame, while the next frame's commands were already in the
+// FIFO. The polls of check_present_status() and early submit sleep the same way whenever the GPU
+// is behind.
+//
+// The marker can only turn an answer into "not yet". While it is unwritten the fence cannot have
+// signalled, because the fence signals after every command of the buffer, this fill and the
+// barrier that makes its write visible to the host included. There is no barrier ahead of the
+// fill, so a written marker does not prove that the commands before it have finished: poke() then
+// asks the fence exactly as it does without markers.
+//
+// Must be the last thing recorded before end(), outside a render pass. Does nothing unless the
+// setting was on when the renderer was created.
+void VKGSRender::arm_completion_marker(vk::command_buffer_chunk* cmd)
+{
+	if (!m_cb_done_markers || vk::g_completion_marker_failed.observe())
+	{
+		return;
+	}
+
+	if (cmd->done_slot == umax)
+	{
+		// A word of its own for each command buffer, so the answer does not depend on the order
+		// in which the GPU completes them
+		if (m_cb_done_slots >= VK_MAX_ASYNC_CB_COUNT)
+		{
+			return;
+		}
+
+		cmd->done_slot = m_cb_done_slots++;
+	}
+
+	if (vk::is_renderpass_open(*cmd))
+	{
+		vk::end_renderpass(*cmd);
+	}
+
+	if (!++m_cb_done_seq)
+	{
+		// 0 is what a cleared marker reads
+		++m_cb_done_seq;
+	}
+
+	const VkDeviceSize offset = cmd->done_slot * sizeof(u32);
+	vkCmdFillBuffer(*cmd, m_cb_done_markers->value, offset, sizeof(u32), m_cb_done_seq);
+	vk::insert_buffer_memory_barrier(*cmd, m_cb_done_markers->value, offset, sizeof(u32),
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+
+	// Until the GPU gets there the word holds what this buffer's previous submission wrote
+	cmd->done_value = m_cb_done_seq;
+	cmd->done_marker = m_cb_done_marker_map + cmd->done_slot;
+}
+
 void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
 {
 	// Every submit of m_current_command_buffer passes here: early submit counts from zero again
@@ -3197,6 +3328,14 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore 
 	}
 
 	vk::get_gpu_timer().end(*m_current_command_buffer, vk::gpu_timer::region::frame);
+
+	if (!pFence)
+	{
+		// A buffer submitted with the caller's own fence is never pending for poke(), so it needs
+		// no marker
+		arm_completion_marker(m_current_command_buffer);
+	}
+
 	m_current_command_buffer->end();
 	m_current_command_buffer->tag();
 

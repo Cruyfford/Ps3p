@@ -323,6 +323,8 @@ struct DeletePrompt {
         rows[row].progress = nil
         let installed = await Self.installedVersion()
         version = installed
+        // The XMB reads its icons, words and sounds from the firmware just installed.
+        if status == 0 { await XmbFirmware.shared.load(again: true) }
         rows[row].result = Self.describe(status, version: installed)
         return status
     }
@@ -333,6 +335,11 @@ struct DeletePrompt {
         guard !busy, !urls.isEmpty else { return false }
         if Self.installing {
             message = String(localized: "Another install is running. Wait for it to finish.")
+            return false
+        }
+        // Without a prepared core every install fails, so nothing is copied first.
+        if EmulatorSession.shared.browsing {
+            message = EmulatorSession.browsingRefusal
             return false
         }
         Self.installing = true
@@ -390,7 +397,9 @@ struct DeletePrompt {
             let (status, titleId): (Int, String) = await withCheckedContinuation { continuation in
                 Rpcs3Bridge.installPackages(atPaths: job.map { urls[$0].path }, progress: { file, permille in
                     guard Int(file) < job.count else { return }
-                    self.rows[job[Int(file)]].progress = Double(permille) / 1000
+                    // Whole percents, so the XMB's columns, which show the percent, are not rebuilt a thousand times.
+                    let progress = Double(permille / 10) / 100
+                    if self.rows[job[Int(file)]].progress != progress { self.rows[job[Int(file)]].progress = progress }
                 }, completion: { status, titleId in
                     continuation.resume(returning: (status, titleId))
                 })
