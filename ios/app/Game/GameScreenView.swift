@@ -1123,6 +1123,14 @@ struct GameScreenView: View {
             // The state read at boot is STARTING; this picks up RUNNING, and a self-exit.
             await session.refreshState()
             await SessionRecord.shared.update()
+            // A title that ends itself (sys_process_exit, as homebrew and test apps do) goes back to the
+            // menu, the way a PS3 returns to the XMB; before, the last frame stayed up over a stopped core.
+            // A halt keeps its error UI, and a Stop or restart in flight is skipped above.
+            if session.state == EmulatorSession.stateStopped, stopStatus == nil, !stopping, !session.restartPending {
+                stopping = true
+                await closeAfterStop()
+                break
+            }
         }
     }
 
