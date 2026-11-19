@@ -125,6 +125,9 @@ struct PadHoldButton<Key: Hashable> {
     private(set) var waiting = false
     private var held = false
 
+    // Ps3p: explicit, because Swift 6.2 (Xcode 26) makes the memberwise init private here.
+    init(key: Key) { self.key = key }
+
     // Takes the button out of the change; true when it was a short tap that the game should now see.
     mutating func filter(_ change: inout PadChange<Key>) -> Bool {
         if change.pressed.remove(key) != nil { waiting = true }
